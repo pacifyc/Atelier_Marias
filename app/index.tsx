@@ -1,0 +1,2583 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as DocumentPicker from 'expo-document-picker';
+import { cacheDirectory, copyAsync, documentDirectory, EncodingType, getInfoAsync, makeDirectoryAsync, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
+import * as ImagePicker from 'expo-image-picker';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
+import {
+    BarChart2,
+    Camera,
+    CheckCircle2,
+    CheckSquare,
+    ChevronDown,
+    ChevronLeft,
+    Clock,
+    Download,
+    Edit2,
+    FileText,
+    LogOut,
+    Menu,
+    Package,
+    Plus,
+    QrCode,
+    RefreshCw,
+    Save,
+    Scan,
+    Search,
+    Settings,
+    Share2,
+    ShoppingBag,
+    Square,
+    Trash2,
+    User,
+    X
+} from 'lucide-react-native';
+import React, { memo, useEffect, useMemo, useState } from 'react';
+import {
+    Alert,
+    Animated,
+    BackHandler,
+    FlatList,
+    Image,
+    KeyboardAvoidingView,
+    Modal,
+    Platform,
+    SafeAreaView,
+    ScrollView,
+    StatusBar,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View
+} from 'react-native';
+import { initDatabase } from '../src/database/db';
+import { migrateFromAsyncStorage } from '../src/database/migration';
+import { DatabaseService } from '../src/database/service';
+import { SYNC_URL_KEY, SyncService } from '../src/database/syncService';
+
+const BACKGROUND_IMAGE = require('../assets/images/background.png');
+const LOGO_IMAGE = require('../assets/images/logo.png');
+
+const STORAGE_KEY = '@atelier_data_v1';
+const INVENTORY_KEY = '@atelier_inventory_v1';
+const CATEGORIES_KEY = '@atelier_categories_v1';
+const SETTINGS_KEY = '@atelier_settings_v1';
+
+// --- Interfaces ---
+interface Theme {
+    id: string;
+    primary: string;
+    dark: string;
+    background: string;
+    light: string;
+}
+
+const DEFAULT_THEMES: Theme[] = [
+    { id: 'green', primary: '#2e7d32', dark: '#1b5e20', background: '#F1F8E9', light: '#81c784' },
+    { id: 'blue', primary: '#1565c0', dark: '#0d47a1', background: '#E3F2FD', light: '#64b5f6' },
+    { id: 'purple', primary: '#6a1b9a', dark: '#4a148c', background: '#F3E5F5', light: '#ba68c8' },
+    { id: 'red', primary: '#c62828', dark: '#b71c1c', background: '#FFEBEE', light: '#e57373' },
+    { id: 'teal', primary: '#00695c', dark: '#004d40', background: '#E0F2F1', light: '#4db6ac' },
+    { id: 'dark', primary: '#37474f', dark: '#263238', background: '#ECEFF1', light: '#78909c' },
+];
+interface Produto {
+    id?: string;
+    name: string;
+    price: string;
+    quantity: string;
+    inventoryId?: string;
+}
+
+interface Parcela {
+    number: number;
+    date: string;
+    value: number;
+    status: 'pending' | 'paid';
+    isLocked?: boolean;
+}
+
+interface Venda {
+    id: string;
+    client: string;
+    date: string;
+    products: Produto[];
+    paymentType: 'vista' | 'parcelado';
+    installments: string;
+    installmentList: Parcela[];
+    totalValue: number; // Agora obrigatório
+}
+
+interface ItemEstoque {
+    id: string;
+    name: string;
+    price: string;
+    image: string | null;
+    category?: string;
+    stock: number;
+    history: Array<{ date: string; type: 'input' | 'output' | 'sale'; quantity: number }>;
+}
+
+// --- Componentes Auxiliares ---
+
+const ThemeBarWrapper = ({ children, primaryColor }: { children: React.ReactNode, primaryColor: string }) => {
+    return (
+        <View style={{ flex: 1 }}>
+            <View style={{ height: 30, backgroundColor: primaryColor }} />
+            {children}
+            <View style={{ height: 40, backgroundColor: primaryColor }} />
+        </View>
+    );
+};
+
+// --- Componentes Memoizados para Performance ---
+
+const InventoryItem = memo(({ item, onPreview, onEdit, onDelete, onAddToQueue, isInQueue, theme }: any) => (
+    <View style={styles.itemCard}>
+        <View style={styles.row}>
+            <View style={styles.thumbWrapper}>
+                {item.image ? (
+                    <TouchableOpacity onPress={() => onPreview(item.image)}>
+                        <Image source={{ uri: item.image }} style={styles.thumb} resizeMode="cover" />
+                    </TouchableOpacity>
+                ) : (
+                    <View style={[styles.thumb, { backgroundColor: '#eee', justifyContent: 'center', alignItems: 'center' }]}>
+                        <Package size={20} color="#ccc" />
+                    </View>
+                )}
+            </View>
+            <View style={{ flex: 1 }}>
+                <Text style={styles.itemName}>{item.name}</Text>
+                <View style={styles.row}>
+                    <Text style={styles.itemPrice}>R$ {item.price.replace('.', ',')}</Text>
+                </View>
+            </View>
+            <View style={styles.actions}>
+                <TouchableOpacity onPress={() => onAddToQueue(item)}>
+                    <FileText size={20} color={isInQueue ? theme.primary : '#ccc'} fill={isInQueue ? theme.primary : 'none'} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => onEdit(item, 'edit')}><Edit2 size={20} color={theme.primary} /></TouchableOpacity>
+                <TouchableOpacity onPress={() => onDelete(item.id)}><Trash2 size={20} color="#ff4d4d" /></TouchableOpacity>
+            </View>
+        </View>
+    </View>
+));
+
+const SaleItem = memo(({ item, onEdit, onDelete, onToggleStatus, theme, getStatusInfo }: any) => (
+    <View style={styles.itemCard}>
+        <View style={styles.saleHeader}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+                <View style={styles.row}>
+                    <User size={16} color={theme.primary} />
+                    <Text style={styles.clientName} numberOfLines={1} ellipsizeMode="tail">{item.client}</Text>
+                </View>
+                <View style={styles.row}><Clock size={14} color="#666" /><Text style={styles.dateText}>{item.date.split('-').reverse().join('/')}</Text></View>
+            </View>
+            <View style={styles.actions}>
+                <TouchableOpacity onPress={() => onEdit(item)}><Edit2 size={20} color={theme.primary} /></TouchableOpacity>
+                <TouchableOpacity onPress={() => onDelete(item.id)}><Trash2 size={20} color="#ff4d4d" /></TouchableOpacity>
+            </View>
+        </View>
+        <View style={{ gap: 5 }}>
+            {item.products.map((p: any, i: number) => (
+                <View key={i} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                    <Text style={{ fontSize: 13, color: '#555' }}>{p.quantity}x {p.name}</Text>
+                    <Text style={{ fontSize: 13, fontWeight: 'bold' }}>R$ {(parseFloat(p.price) * (parseInt(p.quantity) || 1)).toFixed(2).replace('.', ',')}</Text>
+                </View>
+            ))}
+            <View style={styles.instList}>
+                {item.installmentList.map((inst: any, i: number) => {
+                    const info = getStatusInfo(inst);
+                    return (
+                        <View key={i} style={styles.instRow}>
+                            <Text style={{ fontSize: 12 }}>{i + 1}ª - {inst.date.split('-').reverse().join('/')} (R$ {inst.value.toFixed(2)})</Text>
+                            <TouchableOpacity style={[styles.stBtn, { backgroundColor: info.color }]} onPress={() => onToggleStatus(item.id, i)}><Text style={{ fontSize: 10 }}>{info.text}</Text></TouchableOpacity>
+                        </View>
+                    );
+                })}
+            </View>
+            <View style={styles.totalR}>
+                <Text style={{ fontSize: 12, fontWeight: 'bold' }}>TOTAL:</Text>
+                <Text style={{ fontSize: 18, fontWeight: 'bold', color: theme.primary }}>
+                    R$ {item.products.reduce((acc: any, c: any) => acc + (parseFloat(c.price || '0') * (parseInt(c.quantity || '1') || 1)), 0).toFixed(2).replace('.', ',')}
+                </Text>
+            </View>
+        </View>
+    </View>
+));
+
+const ReportRecord = memo(({ item, theme }: any) => (
+    <View style={styles.repItem}>
+        <View style={{ flex: 1 }}>
+            <Text style={{ fontWeight: 'bold' }}>{item.client}</Text>
+            <Text style={{ fontSize: 12 }}>{item.installment.number}ª Parc. - {item.installment.date.split('-').reverse().join('/')}</Text>
+        </View>
+        <Text style={{ fontWeight: 'bold', color: theme.primary }}>R$ {item.installment.value.toFixed(2).replace('.', ',')}</Text>
+    </View>
+));
+
+export default function App() {
+    // Navegação
+    const [view, setView] = useState<string>('menu');
+
+    // Dados de Vendas
+    const [sales, setSales] = useState<Venda[]>([]);
+    const [editingSale, setEditingSale] = useState<Venda | null>(null);
+    const [reportFilter, setReportFilter] = useState<'pagas' | 'atrasadas' | 'apagar'>('pagas');
+
+    // Dados de Produtos (Estoque/QR)
+    const [inventory, setInventory] = useState<ItemEstoque[]>([]);
+    const [editingProduct, setEditingProduct] = useState<ItemEstoque | null>(null);
+
+    // Dados de Categorias
+    const [categories, setCategories] = useState<string[]>(['Geral']);
+    const [selectedCategory, setSelectedCategory] = useState<string>('Geral');
+    const [newCategoryName, setNewCategoryName] = useState('');
+    const [showCategoryModal, setShowCategoryModal] = useState(false);
+
+    // Fila de Impressão
+    const [printQueue, setPrintQueue] = useState<ItemEstoque[]>([]);
+    const [showPrintQueueModal, setShowPrintQueueModal] = useState(false);
+    const [batchQrIncludePrice, setBatchQrIncludePrice] = useState(false);
+    const [batchQrIncludeName, setBatchQrIncludeName] = useState(false);
+
+    const togglePrintQueue = (item: ItemEstoque) => {
+        const index = printQueue.findIndex(q => q.id === item.id);
+        if (index >= 0) {
+            setPrintQueue(printQueue.filter(q => q.id !== item.id));
+        } else {
+            setPrintQueue([...printQueue, item]);
+        }
+    };
+
+    // Estado do Drawer
+    const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+    const [drawerAnim] = useState(new Animated.Value(-300)); // Começa fora da tela
+
+    const toggleDrawer = () => {
+        const toValue = isDrawerOpen ? -310 : 0;
+        Animated.timing(drawerAnim, {
+            toValue,
+            duration: 300,
+            useNativeDriver: true,
+        }).start();
+        setIsDrawerOpen(!isDrawerOpen);
+    };
+
+    const navigateFromDrawer = (targetView: string) => {
+        setView(targetView);
+        toggleDrawer();
+    };
+
+    const renderDrawer = () => {
+        return (
+            <Animated.View style={[styles.drawer, { transform: [{ translateX: drawerAnim }] }]}>
+                <SafeAreaView style={{ flex: 1, backgroundColor: appTheme.primary }}>
+                    <View style={styles.drawerHeader}>
+                        <View style={styles.drawerLogoWrapper}>
+                            <Image source={appLogo ? { uri: appLogo } : LOGO_IMAGE} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
+                        </View>
+                        <Text style={styles.drawerTitle}>{appAtelierName}</Text>
+                    </View>
+                    <ScrollView style={styles.drawerContent}>
+                        <TouchableOpacity style={styles.drawerItem} onPress={() => navigateFromDrawer('menu')}>
+                            <Package color="#fff" size={24} />
+                            <Text style={styles.drawerItemText}>Início</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.drawerItem} onPress={() => navigateFromDrawer('list')}>
+                            <ShoppingBag color="#fff" size={24} />
+                            <Text style={styles.drawerItemText}>Vendas</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.drawerItem} onPress={() => navigateFromDrawer('reports')}>
+                            <BarChart2 color="#fff" size={24} />
+                            <Text style={styles.drawerItemText}>Relatórios</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.drawerItem} onPress={() => navigateFromDrawer('categories_list')}>
+                            <QrCode color="#fff" size={24} />
+                            <Text style={styles.drawerItemText}>Produtos / QR</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.drawerItem} onPress={() => navigateFromDrawer('settings')}>
+                            <Settings color="#fff" size={24} />
+                            <Text style={styles.drawerItemText}>Configurações</Text>
+                        </TouchableOpacity>
+                    </ScrollView>
+                    <TouchableOpacity style={[styles.drawerItem, { marginBottom: 40 }]} onPress={() => BackHandler.exitApp()}>
+                        <LogOut color="#fff" size={24} />
+                        <Text style={styles.drawerItemText}>Sair</Text>
+                    </TouchableOpacity>
+                </SafeAreaView>
+            </Animated.View>
+        );
+    };
+    const [searchQuery, setSearchQuery] = useState('');
+    const [isSearching, setIsSearching] = useState(false);
+    const [saleSearchQuery, setSaleSearchQuery] = useState('');
+    const [isSaleSearching, setIsSaleSearching] = useState(false);
+
+    // Estado de Configurações
+    const [appLogo, setAppLogo] = useState<string | null>(null);
+    const [appTheme, setAppTheme] = useState<Theme>(DEFAULT_THEMES[0]);
+    const [appAtelierName, setAppAtelierName] = useState('ATELIER MARIAS');
+    const [syncUrl, setSyncUrl] = useState('');
+    const [isSyncing, setIsSyncing] = useState(false);
+
+    // Estado de Busca nos Relatórios
+    const [reportSearchQuery, setReportSearchQuery] = useState('');
+    const [isReportSearching, setIsReportSearching] = useState(false);
+
+    // Estado do Formulário Vendas
+    const [client, setClient] = useState('');
+    const [showClientSuggestions, setShowClientSuggestions] = useState(false);
+    const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+    const [products, setProducts] = useState<Produto[]>([{ name: '', price: '', quantity: '1' }]);
+    const [paymentType, setPaymentType] = useState<'vista' | 'parcelado'>('vista');
+    const [installments, setInstallments] = useState('1');
+    const [installmentList, setInstallmentList] = useState<Parcela[]>([]);
+    const [showPicker, setShowPicker] = useState(false);
+    const [showInstallmentsEditor, setShowInstallmentsEditor] = useState(false);
+
+    // Estado do Formulário QR/Estoque
+    const [prodName, setProdName] = useState('');
+    const [prodPrice, setProdPrice] = useState('');
+    const [prodImage, setProdImage] = useState<string | null>(null);
+    const [prodCategory, setProdCategory] = useState('Geral');
+    const [prodStock, setProdStock] = useState(0);
+    const [prodHistory, setProdHistory] = useState<Array<{ date: string; type: 'input' | 'output' | 'sale'; quantity: number }>>([]);
+
+    // Estado do Modal de Ajuste de Estoque
+    const [showStockModal, setShowStockModal] = useState(false);
+    const [stockModalType, setStockModalType] = useState<'input' | 'output'>('input');
+    const [stockAdjustment, setStockAdjustment] = useState('');
+    const [showResetDataSection, setShowResetDataSection] = useState(false);
+
+    // Estado do Modal de Opções de QR
+    const [showQrOptionsModal, setShowQrOptionsModal] = useState(false);
+    const [qrIncludePrice, setQrIncludePrice] = useState(true);
+    const [qrProductForModal, setQrProductForModal] = useState<ItemEstoque | null>(null);
+
+    const handlePickLogo = async () => {
+        const result = await ImagePicker.launchImageLibraryAsync({
+            mediaTypes: ImagePicker.MediaTypeOptions.Images,
+            allowsEditing: true,
+            aspect: [1, 1],
+            quality: 0.8,
+        });
+        if (!result.canceled) {
+            setAppLogo(result.assets[0].uri);
+            saveSettings(result.assets[0].uri, appTheme, appAtelierName);
+        }
+    };
+
+    // Câmera e Scanner
+    const [permission, requestPermission] = useCameraPermissions();
+    const [scanning, setScanning] = useState(false);
+    const [scannedItem, setScannedItem] = useState<ItemEstoque | null>(null);
+    const [selectedImage, setSelectedImage] = useState<string | null>(null);
+    const [scanningForSale, setScanningForSale] = useState(false);
+
+    useEffect(() => {
+        const init = async () => {
+            await migrateFromAsyncStorage();
+            await loadData();
+            ensureFolders();
+        };
+        init();
+    }, []);
+
+    const ensureFolders = async () => {
+        const photosFolder = `${documentDirectory}photos/`;
+        const info = await getInfoAsync(photosFolder);
+        if (!info.exists) {
+            await makeDirectoryAsync(photosFolder, { intermediates: true });
+        }
+    };
+
+    useEffect(() => {
+        if (view === 'form') generateInstallments();
+    }, [installments, paymentType, date, products, view]);
+
+    const loadData = async () => {
+        try {
+            const dbSales = await DatabaseService.getSales();
+            setSales(dbSales);
+
+            const dbInventory = await DatabaseService.getInventory();
+            setInventory(dbInventory);
+
+            const dbCategories = await DatabaseService.getCategories();
+            if (dbCategories.length > 0) {
+                setCategories(dbCategories);
+            } else {
+                setCategories(['Geral']);
+            }
+
+            // Load settings
+            const savedSettings = await AsyncStorage.getItem(SETTINGS_KEY);
+            if (savedSettings) {
+                const { logo, themeId, atelierName } = JSON.parse(savedSettings);
+                if (logo) setAppLogo(logo);
+                if (themeId) {
+                    const savedTheme = DEFAULT_THEMES.find(t => t.id === themeId);
+                    if (savedTheme) setAppTheme(savedTheme);
+                }
+                if (atelierName) setAppAtelierName(atelierName);
+            }
+
+            // Load Sync URL
+            const url = await SyncService.getSyncUrl();
+            if (url) setSyncUrl(url);
+
+        } catch (e) {
+            console.error(e);
+        }
+    };
+
+    const saveSettings = async (logo: string | null, theme: Theme, atelierName: string) => {
+        try {
+            const settingsData = JSON.stringify({ logo, themeId: theme.id, atelierName });
+            await AsyncStorage.setItem(SETTINGS_KEY, settingsData);
+        } catch (e) {
+            console.error(e);
+        }
+    };
+
+    // saveData removido em favor de DatabaseService específico
+
+
+
+    // --- Lógica de Vendas ---
+
+    const generateInstallments = () => {
+        const total = products.reduce((acc, curr) => {
+            const p = parseFloat(curr.price || '0');
+            const q = parseInt(curr.quantity || '1') || 1;
+            return acc + (p * q);
+        }, 0);
+        const num = parseInt(installments) || 1;
+
+        if (paymentType === 'vista') {
+            setInstallmentList([{
+                number: 1,
+                date: date,
+                value: total,
+                status: editingSale?.installmentList?.[0]?.status || 'pending',
+                isLocked: false
+            }]);
+            return;
+        }
+
+        // Se o número de parcelas mudou, regeneramos tudo
+        if (installmentList.length !== num) {
+            const newList: Parcela[] = [];
+            const baseDate = new Date(date + 'T12:00:00');
+            const value = total / num;
+            for (let i = 0; i < num; i++) {
+                const d = new Date(baseDate);
+                d.setMonth(baseDate.getMonth() + i);
+                newList.push({
+                    number: i + 1,
+                    date: d.toISOString().split('T')[0],
+                    value: value,
+                    status: (editingSale && editingSale.installmentList[i]) ? editingSale.installmentList[i].status : 'pending',
+                    isLocked: false
+                });
+            }
+            setInstallmentList(newList);
+        } else {
+            // Se o número for igual, atualizamos as parcelas NÃO travadas com o saldo restante
+            const lockedValue = installmentList.reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
+            const unlockedCount = installmentList.filter(inst => !inst.isLocked).length;
+
+            if (unlockedCount > 0) {
+                const remainingValue = Math.max(0, total - lockedValue);
+                const newValue = remainingValue / unlockedCount;
+
+                const newList = installmentList.map(inst => inst.isLocked ? inst : { ...inst, value: newValue });
+
+                if (JSON.stringify(newList) !== JSON.stringify(installmentList)) {
+                    setInstallmentList(newList);
+                }
+            } else if (Math.abs(lockedValue - total) > 0.01) {
+                // Se todas estão travadas mas o total mudou, destravamos a última para ajustar
+                const newList = [...installmentList];
+                newList[newList.length - 1].isLocked = false;
+                setInstallmentList(newList);
+            }
+        }
+    };
+
+    const handleUpdateInstallment = (idx: number, field: keyof Parcela, value: any) => {
+        const newList = [...installmentList];
+        if (field === 'value') {
+            // Se o valor for vazio (usuário apagando), mantemos como string vazia temporariamente no input,
+            // mas no estado numérico tratamos de forma que permita a redistribuição.
+            const rawValue = value.replace(',', '.');
+            const numValue = parseFloat(rawValue) || 0;
+
+            newList[idx].value = numValue;
+            newList[idx].isLocked = true; // Marca como editada manualmente
+
+            // Redistribuição automática
+            const total = products.reduce((acc, curr) => {
+                const p = parseFloat(curr.price || '0');
+                const q = parseInt(curr.quantity || '1') || 1;
+                return acc + (p * q);
+            }, 0);
+
+            // Calculamos quanto já foi travado (incluindo a que acabamos de editar)
+            const lockedValue = newList.reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
+
+            // Identificamos as parcelas seguintes (após a atual) que NÃO estão travadas
+            const targets = newList.slice(idx + 1).filter(inst => !inst.isLocked);
+
+            if (targets.length > 0) {
+                // Se houver parcelas destravadas após a atual, divide o saldo entre elas
+                const alreadyLockedValueBeforeIdx = newList.slice(0, idx + 1).reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
+                const lockedValueAfterIdx = newList.slice(idx + 1).reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
+
+                const remainingToDistribute = Math.max(0, total - alreadyLockedValueBeforeIdx - lockedValueAfterIdx);
+                const distributedValue = Number((remainingToDistribute / targets.length).toFixed(2));
+
+                // Aplica o valor distribuído apenas nas destravadas após a editada
+                for (let i = idx + 1; i < newList.length; i++) {
+                    if (!newList[i].isLocked) {
+                        newList[i].value = distributedValue;
+                    }
+                }
+            } else {
+                // Se não houver destravadas APÓS, mas houver destravadas ANTES, distribui nelas?
+                // Melhor manter o solicitado: redistribuir o valor restante nas parcelas seguintes.
+                // Se não houver seguintes, a soma pode não bater até que o usuário ajuste.
+            }
+        } else {
+            newList[idx][field] = value;
+        }
+        setInstallmentList(newList);
+    };
+
+    const openSaleForm = (sale: Venda | null = null) => {
+        if (sale) {
+            setEditingSale(sale);
+            setClient(sale.client);
+            setDate(sale.date);
+            setProducts(sale.products);
+            setPaymentType(sale.paymentType || 'vista');
+            setInstallments(sale.installments || '1');
+            setInstallmentList(sale.installmentList || []);
+            setShowInstallmentsEditor(false);
+        } else {
+            setEditingSale(null);
+            setClient(''); setDate(new Date().toISOString().split('T')[0]);
+            setProducts([{ name: '', price: '', quantity: '1' }]); setPaymentType('vista');
+            setInstallments('1'); setInstallmentList([]);
+            setShowInstallmentsEditor(false);
+        }
+        setShowClientSuggestions(false);
+        setView('form');
+    };
+
+    const handleUpdateProductInSale = (idx: number, field: keyof Produto, value: string) => {
+        const newProducts = [...products];
+        if (field === 'price') {
+            newProducts[idx][field] = value.replace(',', '.');
+        } else {
+            newProducts[idx][field] = value;
+        }
+        setProducts(newProducts);
+    };
+
+    const handleSaveSale = () => {
+        if (!client || products.some(p => !p.name || !p.price || isNaN(parseFloat(p.price)) || !p.quantity || isNaN(parseInt(p.quantity)))) {
+            Alert.alert('Atenção', 'Preencha todos os campos corretamente.');
+            return;
+        }
+        const totalValue = products.reduce((acc, p) => acc + (parseFloat(p.price || '0') * (parseInt(p.quantity || '1') || 1)), 0);
+        const saleData: Venda = {
+            id: editingSale?.id || Date.now().toString(),
+            client, date, products, paymentType,
+            installments: paymentType === 'parcelado' ? installments : '1',
+            installmentList,
+            totalValue
+        };
+        const updated = editingSale ? sales.map(s => s.id === editingSale.id ? saleData : s) : [saleData, ...sales];
+        setSales(updated);
+        DatabaseService.saveSale(saleData);
+
+        // Baixa automática de estoque
+        if (products.length > 0) {
+            const newInventory = [...inventory];
+            let inventoryChanged = false;
+
+            products.forEach(p => {
+                if (p.inventoryId) {
+                    const itemIdx = newInventory.findIndex(item => item.id === p.inventoryId);
+                    if (itemIdx !== -1) {
+                        const qty = parseInt(p.quantity) || 1;
+                        newInventory[itemIdx].stock -= qty;
+
+                        // Adicionar ao histórico
+                        const historyEntry = {
+                            date: new Date().toISOString(), // Timestamp completo
+                            type: 'sale' as const,
+                            quantity: qty
+                        };
+                        newInventory[itemIdx].history = [historyEntry, ...(newInventory[itemIdx].history || [])];
+                        inventoryChanged = true;
+                    }
+                }
+            });
+
+            if (inventoryChanged) {
+                setInventory(newInventory);
+                // Atualizar produtos modificados no banco
+                newInventory.forEach(async (item) => {
+                    // Otimização: Poderíamos filtrar apenas os mudados, mas aqui iteramos
+                    // Na verdade, só precisamos salvar os itens que foram vendidos.
+                    // Mas a lógica anterior `inventoryChanged` não dizia QUAIS mudaram.
+                    // Vamos salvar APENAS os envolvidos na venda para ser eficiente.
+                });
+                // Correção: salvar apenas os itens alterados
+                products.forEach(async p => {
+                    if (p.inventoryId) {
+                        const item = newInventory.find(i => i.id === p.inventoryId);
+                        if (item) await DatabaseService.saveProduct(item);
+                    }
+                });
+            }
+        }
+
+        setView('list');
+    };
+
+    const handleDeleteSale = (id: string) => {
+        Alert.alert("Excluir Venda", "Tem certeza?", [
+            { text: "Cancelar" },
+            {
+                text: "Excluir", style: "destructive", onPress: () => {
+                    const updated = sales.filter(s => s.id !== id);
+                    setSales(updated);
+                    DatabaseService.deleteSale(id);
+                }
+            }
+        ]);
+    };
+
+    // --- Lógica de Estoque / QR ---
+
+    const openQrForm = (prod: ItemEstoque | null = null) => {
+        if (prod) {
+            setEditingProduct(prod);
+            setProdName(prod.name);
+            setProdPrice(prod.price);
+            setProdImage(prod.image);
+            setProdCategory(prod.category || 'Geral');
+            setProdStock(prod.stock || 0);
+            setProdHistory(prod.history || []);
+        } else {
+            setEditingProduct(null);
+            setProdName('');
+            setProdPrice('');
+            setProdImage(null);
+            setProdCategory(selectedCategory || 'Geral');
+            setProdStock(0);
+            setProdHistory([]);
+        }
+        setView('qr_form');
+    };
+
+    const handleStockAdjustment = () => {
+        const qty = parseInt(stockAdjustment);
+        if (isNaN(qty) || qty <= 0) {
+            Alert.alert('Atenção', 'Digite uma quantidade válida.');
+            return;
+        }
+
+        const type = stockModalType;
+        const newStockCount = type === 'input' ? prodStock + qty : prodStock - qty;
+
+        const historyEntry = {
+            date: new Date().toISOString(), // Timestamp completo
+            type: type,
+            quantity: qty
+        };
+
+        const newHistory = [historyEntry, ...prodHistory];
+
+        // Atualiza estado local do formulário
+        setProdStock(newStockCount);
+        setProdHistory(newHistory);
+
+
+
+        // Salvar alterações de estoque/histórico no banco
+        if (editingProduct) {
+            const updatedItem = { ...editingProduct, stock: newStockCount, history: newHistory };
+            // Atualiza lista local
+            const updatedInventory = inventory.map(p => p.id === editingProduct.id ? updatedItem : p);
+            setInventory(updatedInventory);
+
+            DatabaseService.saveProduct(updatedItem);
+        }
+
+        setStockAdjustment('');
+        setShowStockModal(false);
+    };
+
+    const handleSaveProduct = async () => {
+        if (!prodName || !prodPrice) {
+            Alert.alert('Atenção', 'Preencha nome e preço.');
+            return;
+        }
+
+        const proceedSave = async () => {
+            let finalImagePath = prodImage;
+
+            // Se for uma imagem nova (está no cache), movemos para a pasta permanente
+            if (prodImage && prodImage.includes('ImagePicker')) {
+                try {
+                    const filename = `prod_${Date.now()}.jpg`;
+                    const permanentPath = `${documentDirectory}photos/${filename}`;
+                    await copyAsync({
+                        from: prodImage,
+                        to: permanentPath
+                    });
+                    finalImagePath = permanentPath;
+                } catch (e) {
+                    console.error("Erro ao persistir imagem:", e);
+                    Alert.alert("Aviso", "A foto foi salva mas pode ser temporária.");
+                }
+            }
+
+            const prodData: ItemEstoque = {
+                id: editingProduct?.id || Date.now().toString(),
+                name: prodName,
+                price: prodPrice,
+                image: finalImagePath || null,
+                category: prodCategory,
+                stock: prodStock,
+                history: prodHistory
+            };
+            const updated = editingProduct ? inventory.map(p => p.id === editingProduct.id ? prodData : p) : [prodData, ...inventory];
+            setInventory(updated);
+
+            await DatabaseService.saveProduct(prodData);
+
+            // Se for nova categoria, salva também
+            if (!categories.includes(prodCategory)) {
+                const newCats = [...categories, prodCategory];
+                setCategories(newCats);
+                await DatabaseService.addCategory(prodCategory);
+            }
+
+            setView('categories_list');
+        };
+
+        if (!prodImage) {
+            Alert.alert("Confirmação", "Deseja salvar este produto sem foto?", [
+                { text: "Tirar Foto", onPress: handlePickImage },
+                { text: "Salvar Sem Foto", onPress: proceedSave }
+            ]);
+        } else {
+            await proceedSave();
+        }
+    };
+
+    const handleDeleteProduct = (id: string) => {
+        Alert.alert("Excluir", "Deseja excluir este item?", [
+            { text: "Não" },
+            {
+                text: "Sim", onPress: () => {
+                    const updated = inventory.filter(p => p.id !== id);
+                    setInventory(updated);
+                    DatabaseService.deleteProduct(id);
+                }
+            }
+        ]);
+    };
+
+    const handlePickImage = async () => {
+        const { status } = await ImagePicker.requestCameraPermissionsAsync();
+        if (status !== 'granted') {
+            Alert.alert('Erro', 'Precisamos da permissão da câmera para tirar a foto do produto.');
+            return;
+        }
+
+        const result = await ImagePicker.launchCameraAsync({
+            quality: 0.7,
+            allowsEditing: false
+        });
+
+        if (!result.canceled) {
+            const uri = result.assets ? result.assets[0].uri : (result as any).uri;
+            if (uri) {
+                setProdImage(uri);
+            } else {
+                Alert.alert('Erro', 'Não foi possível obter o caminho da imagem.');
+            }
+        }
+    };
+
+    const generateTagPDF = async (prod: ItemEstoque, includePrice: boolean = true) => {
+        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${prod.id}`;
+        const html = `
+      <html>
+        <head>
+          <style>
+            body { 
+              display: flex; 
+              justify-content: center; 
+              align-items: flex-start;
+              padding: 20px; 
+              font-family: 'Helvetica', sans-serif;
+            }
+            .label-container {
+              width: 250px; 
+              border: 1px solid ${appTheme.primary}; 
+              border-radius: 12px; 
+              padding: 15px; 
+              text-align: center; 
+              background: ${appTheme.background};
+            }
+            .atelier-name {
+              color: ${appTheme.dark}; 
+              font-weight: bold;
+              font-size: 24px;
+              margin: 0 0 5px 0;
+              text-transform: uppercase;
+            }
+            .product-name {
+              font-weight: bold; 
+              font-size: 20px;
+              margin-bottom: 2px;
+            }
+            .product-price {
+              font-size: 28px; 
+              color: ${appTheme.primary}; 
+              font-weight: bold;
+              margin: 5px 0;
+            }
+            .qr-code {
+              width: 3cm; 
+              height: 3cm; 
+              margin-top: 5px;
+            }
+            .ref-id {
+              font-size: 10px; 
+              color: #888; 
+              margin-top: 8px;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="label-container">
+            <h3 class="atelier-name">${appAtelierName || 'ATELIÊ'}</h3>
+            <div class="product-name">${prod.name}</div>
+            ${includePrice ? `<div class="product-price">R$ ${parseFloat(prod.price).toFixed(2).replace('.', ',')}</div>` : ''}
+            <img src="${qrUrl}" class="qr-code" />
+            <div class="ref-id">Ref: ${prod.id}</div>
+          </div>
+        </body>
+      </html>
+    `;
+        try {
+            const { uri } = await Print.printToFileAsync({ html });
+            await Sharing.shareAsync(uri);
+        } catch (e) {
+            Alert.alert('Erro', 'Não foi possível gerar PDF.');
+        }
+    };
+
+    const generateBatchPDF = async () => {
+        if (printQueue.length === 0) {
+            Alert.alert('Fila Vazia', 'Adicione produtos à fila primeiro.');
+            return;
+        }
+
+        const isStandard = batchQrIncludeName;
+        const isPriceOnly = !batchQrIncludeName && batchQrIncludePrice;
+        const isCompact = !batchQrIncludeName && !batchQrIncludePrice;
+        const col6 = isPriceOnly || isCompact;
+        const noRef = isPriceOnly || isCompact;
+
+        const html = `
+      <html>
+        <head>
+          <style>
+            @page { size: A4; margin: 10mm; }
+            body { font-family: 'Helvetica', sans-serif; margin: 0; padding: 0; background: #fff; }
+            .grid { 
+              display: flex;
+              flex-wrap: wrap;
+              gap: ${col6 ? '2mm' : '5mm'};
+              justify-content: flex-start;
+            }
+            .label-container {
+              width: ${col6 ? '30mm' : '58mm'};
+              height: ${isStandard ? '70mm' : (isPriceOnly ? '40mm' : '30mm')};
+              border: 1px solid #eee; 
+              border-radius: 5px; 
+              padding: ${col6 ? '1mm' : '5mm'}; 
+              text-align: center; 
+              display: flex;
+              flex-direction: column;
+              justify-content: ${col6 ? 'center' : 'space-between'};
+              align-items: center;
+              box-sizing: border-box;
+              margin-bottom: ${col6 ? '2mm' : '5mm'};
+              page-break-inside: avoid;
+            }
+            .atelier-name {
+              color: ${appTheme.dark}; 
+              font-weight: bold;
+              font-size: ${col6 ? '8px' : '12px'};
+              margin: 0;
+              text-transform: uppercase;
+            }
+            .product-name {
+              font-weight: bold; 
+              font-size: 14px;
+              margin-top: 2mm;
+              height: 10mm;
+              overflow: hidden;
+            }
+            .product-price {
+              font-size: ${col6 ? '14px' : '18px'}; 
+              color: ${appTheme.primary}; 
+              font-weight: bold;
+              margin: ${col6 ? '1mm 0' : '2mm 0'};
+            }
+            .qr-code {
+              width: ${col6 ? '20mm' : '30mm'}; 
+              height: ${col6 ? '20mm' : '30mm'}; 
+            }
+            .ref-id {
+              font-size: 8px; 
+              color: #888; 
+              margin-top: 2mm;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="grid">
+            ${printQueue.map(prod => {
+            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${prod.id}`;
+            return `
+              <div class="label-container">
+                <div class="atelier-name">${appAtelierName || 'ATELIÊ'}</div>
+                ${batchQrIncludeName ? `<div class="product-name">${prod.name}</div>` : ''}
+                ${batchQrIncludePrice ? `<div class="product-price">R$ ${parseFloat(prod.price).toFixed(2).replace('.', ',')}</div>` : ''}
+                <img src="${qrUrl}" class="qr-code" />
+                ${!noRef ? `<div class="ref-id">Ref: ${prod.id}</div>` : ''}
+              </div>
+            `}).join('')}
+          </div>
+        </body>
+      </html>
+    `;
+        try {
+            const { uri } = await Print.printToFileAsync({ html });
+            await Sharing.shareAsync(uri);
+        } catch (e) {
+            Alert.alert('Erro', 'Não foi possível gerar PDF.');
+        }
+    };
+
+    const handleShareImage = async (imageUri: string) => {
+        try {
+            if (!(await Sharing.isAvailableAsync())) {
+                Alert.alert('Erro', 'O compartilhamento não está disponível neste dispositivo.');
+                return;
+            }
+            await Sharing.shareAsync(imageUri);
+        } catch (error) {
+            Alert.alert('Erro', 'Não foi possível compartilhar a imagem.');
+        }
+    };
+
+    const generateProductHistoryPDF = async (prod: ItemEstoque) => {
+        const history = prod.history || [];
+        const typeLabels = { input: 'ENTRADA', output: 'SAÍDA', sale: 'VENDA' };
+
+        const html = `
+      <html>
+        <head>
+          <style>
+            body { font-family: 'Helvetica'; padding: 20px; }
+            h1 { color: ${appTheme.primary}; text-align: center; margin-bottom: 5px; }
+            h2 { text-align: center; color: #666; font-size: 16px; margin-top: 0; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+            th { background-color: ${appTheme.primary}; color: white; }
+            .footer { margin-top: 20px; text-align: right; font-weight: bold; font-size: 18px; }
+          </style>
+        </head>
+        <body>
+          <h1>RELATÓRIO DE MOVIMENTAÇÃO</h1>
+          <h2>PRODUTO: ${prod.name.toUpperCase()}</h2>
+          <table>
+            <thead><tr><th>DATA</th><th>TIPO</th><th>QUANTIDADE</th></tr></thead>
+            <tbody>
+              ${history.map(h => {
+            const d = h.date.includes('T') ? new Date(h.date) : null;
+            const dateStr = d ? d.toLocaleDateString('pt-BR') : h.date.split('-').reverse().join('/');
+            const timeStr = d ? ` às ${d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}` : '';
+            return `
+                <tr>
+                  <td>${dateStr}${timeStr}</td>
+                  <td>${typeLabels[h.type]}</td>
+                  <td>${h.quantity}</td>
+                </tr>
+              `}).join('')}
+            </tbody>
+          </table>
+          <div class="footer">SALDO ATUAL EM ESTOQUE: ${prod.stock}</div>
+        </body>
+      </html>
+    `;
+        try {
+            const { uri } = await Print.printToFileAsync({ html });
+            await Sharing.shareAsync(uri);
+        } catch (e) {
+            Alert.alert('Erro', 'Não foi possível gerar PDF.');
+        }
+    };
+
+    const handleBarCodeScanned = ({ data }: { data: string }) => {
+        setScanning(false);
+        const item = inventory.find(p => p.id === data);
+        if (item) {
+            if (scanningForSale) {
+                // Adiciona o produto na lista de vendas (exceto se for o primeiro item vazio, aí substitui)
+                let newProds = [...products];
+                if (newProds.length === 1 && newProds[0].name === '' && newProds[0].price === '') {
+                    newProds = [{ name: item.name, price: item.price, quantity: '1', inventoryId: item.id }];
+                } else {
+                    newProds.push({ name: item.name, price: item.price, quantity: '1', inventoryId: item.id });
+                }
+                setProducts(newProds);
+                setScanningForSale(false);
+                Alert.alert('Sucesso', 'Produto adicionado!');
+            } else {
+                setScannedItem(item);
+            }
+        } else {
+            Alert.alert('Ops', 'Produto não encontrado no estoque.');
+            setScanningForSale(false);
+        }
+    };
+
+    // --- Lógica de Categorias ---
+
+    const handleAddCategory = () => {
+        if (!newCategoryName.trim()) return;
+        if (categories.includes(newCategoryName.trim())) {
+            Alert.alert('Erro', 'Categoria já existe.');
+            return;
+        }
+        const newCat = newCategoryName.trim();
+        const updated = [...categories, newCat];
+        setCategories(updated);
+        DatabaseService.addCategory(newCat);
+        setNewCategoryName('');
+        setShowCategoryModal(false);
+        setSelectedCategory(newCategoryName.trim());
+    };
+
+    const handleDeleteCategory = () => {
+        if (selectedCategory === 'Geral') {
+            Alert.alert('Erro', 'A categoria Geral não pode ser excluída.');
+            return;
+        }
+        const hasProducts = inventory.some(p => (p.category || 'Geral') === selectedCategory);
+        if (hasProducts) {
+            Alert.alert('Erro', 'Esta categoria possui produtos. Exclua-os antes de remover a categoria.');
+            return;
+        }
+
+        Alert.alert('Excluir', `Deseja excluir a categoria "${selectedCategory}"?`, [
+            { text: 'Cancelar' },
+            {
+                text: 'Excluir', style: 'destructive', onPress: () => {
+                    DatabaseService.deleteCategory(selectedCategory);
+                    const updated = categories.filter(c => c !== selectedCategory);
+                    setCategories(updated);
+                    setSelectedCategory('Geral');
+                }
+            }
+        ]);
+    };
+
+    // --- Lógica de Relatórios ---
+
+    const filteredInstallments = useMemo(() => {
+        const today = new Date().toISOString().split('T')[0];
+        const allItems: { client: string; installment: Parcela }[] = [];
+        sales.forEach(sale => {
+            sale.installmentList.forEach(inst => {
+                allItems.push({ client: sale.client, installment: inst });
+            });
+        });
+
+        let filtered = allItems;
+        if (reportFilter === 'pagas') {
+            filtered = allItems.filter(item => item.installment.status === 'paid');
+        } else if (reportFilter === 'atrasadas') {
+            filtered = allItems.filter(item => item.installment.status === 'pending' && item.installment.date < today);
+        } else {
+            filtered = allItems.filter(item => item.installment.status === 'pending' && item.installment.date >= today);
+        }
+
+        if (reportSearchQuery) {
+            const query = reportSearchQuery.toLowerCase();
+            filtered = filtered.filter(item => item.client.toLowerCase().includes(query));
+        }
+
+        return filtered;
+    }, [sales, reportFilter, reportSearchQuery]);
+
+    const calculateReportTotal = useMemo(() => {
+        return filteredInstallments.reduce((acc, curr) => acc + curr.installment.value, 0);
+    }, [filteredInstallments]);
+
+    const filteredInventory = useMemo(() => {
+        return inventory.filter(p => {
+            const matchesCategory = (p.category || 'Geral') === selectedCategory;
+            const matchesSearch = p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                p.price.toString().includes(searchQuery);
+            return matchesCategory && matchesSearch;
+        });
+    }, [inventory, selectedCategory, searchQuery]);
+
+    const filteredSales = useMemo(() => {
+        return sales.filter(s => {
+            const query = saleSearchQuery.toLowerCase();
+            const matchesClient = s.client.toLowerCase().includes(query);
+            const matchesProduct = s.products.some(p => p.name.toLowerCase().includes(query));
+            return matchesClient || matchesProduct;
+        });
+    }, [sales, saleSearchQuery]);
+
+    const uniqueClients = useMemo(() => {
+        const names = sales.map(s => s.client.trim());
+        return Array.from(new Set(names)).sort();
+    }, [sales]);
+
+    const filteredClients = useMemo(() => {
+        if (!client.trim()) return [];
+        return uniqueClients.filter(c =>
+            c.toLowerCase().includes(client.toLowerCase()) &&
+            c.toLowerCase() !== client.toLowerCase()
+        );
+    }, [uniqueClients, client]);
+
+    const generateReportPDF = async () => {
+        const items = filteredInstallments;
+        const total = calculateReportTotal;
+        const title = reportFilter === 'pagas' ? 'PAGAS' : reportFilter === 'atrasadas' ? 'ATRASADAS' : 'A PAGAR';
+        const html = `
+      <html>
+        <head>
+          <style>
+            body { font-family: 'Helvetica'; padding: 20px; }
+            h1 { color: #2e7d32; text-align: center; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+            th { background-color: #2e7d32; color: white; }
+            .total { font-size: 20px; font-weight: bold; text-align: right; margin-top: 20px; color: #1b5e20; }
+          </style>
+        </head>
+        <body>
+          <h1>RELATÓRIO DE VENDAS - ${title}</h1>
+          <table>
+            <thead><tr><th>Cliente</th><th>Parcela</th><th>Vencimento</th><th>Valor</th></tr></thead>
+            <tbody>
+              ${items.map(item => `
+                <tr><td>${item.client}</td><td>${item.installment.number}ª</td><td>${item.installment.date.split('-').reverse().join('/')}</td><td>R$ ${item.installment.value.toFixed(2).replace('.', ',')}</td></tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="total">TOTAL: R$ ${total.toFixed(2).replace('.', ',')}</div>
+        </body>
+      </html>
+    `;
+        try {
+            const { uri } = await Print.printToFileAsync({ html });
+            await Sharing.shareAsync(uri);
+        } catch (e) {
+            Alert.alert('Erro', 'Não foi possível gerar PDF.');
+        }
+    };
+
+    const togglePaymentStatus = (saleId: string, idx: number) => {
+        const sale = sales.find(s => s.id === saleId);
+        if (sale?.installmentList[idx].status === 'paid') return;
+
+        Alert.alert("Confirmar", "Deseja confirmar o pagamento desta parcela?", [
+            { text: "Não" },
+            {
+                text: "Sim, Confirmar", onPress: async () => {
+                    const saleToUpdate = sales.find(s => s.id === saleId);
+                    if (saleToUpdate) {
+                        const newList = [...saleToUpdate.installmentList];
+                        newList[idx].status = 'paid';
+                        const updatedSale = { ...saleToUpdate, installmentList: newList };
+
+                        await DatabaseService.saveSale(updatedSale);
+
+                        const updated = sales.map(s => s.id === saleId ? updatedSale : s);
+                        setSales(updated);
+                    }
+                }
+            }
+        ]);
+    };
+
+    const getStatusInfo = (inst: Parcela) => {
+        if (inst.status === 'paid') return { color: '#B2FF59', text: 'PG' };
+        return (inst.date < new Date().toISOString().split('T')[0]) ? { color: '#FF5252', text: '!' } : { color: '#FFD740', text: 'wait' };
+    };
+
+    // --- Lógica de Backup ---
+
+    const handleExportBackup = async () => {
+        try {
+            const dbSales = await DatabaseService.getSales();
+            const dbInventory = await DatabaseService.getInventory();
+            const dbCategories = await DatabaseService.getCategories();
+            const settingsData = await AsyncStorage.getItem(SETTINGS_KEY);
+
+            // Adicionar fotos em Base64 para cada produto
+            const inventoryWithPhotos = await Promise.all(dbInventory.map(async (item) => {
+                if (item.image && (await getInfoAsync(item.image)).exists) {
+                    try {
+                        const base64 = await readAsStringAsync(item.image, { encoding: EncodingType.Base64 });
+                        return { ...item, imageBase64: base64 };
+                    } catch (e) {
+                        console.error("Erro ao converter foto para base64:", e);
+                    }
+                }
+                return item;
+            }));
+
+            const backup = {
+                v: 2,
+                date: new Date().toISOString(),
+                sales: dbSales,
+                inventory: inventoryWithPhotos,
+                categories: dbCategories,
+                settings: settingsData ? JSON.parse(settingsData) : {},
+                syncUrl: await SyncService.getSyncUrl()
+            };
+
+            const backupPath = `${cacheDirectory}ateliermobile_full_backup.json`;
+            await writeAsStringAsync(backupPath, JSON.stringify(backup), { encoding: EncodingType.UTF8 });
+
+            if (await Sharing.isAvailableAsync()) {
+                await Sharing.shareAsync(backupPath, { mimeType: 'application/json', dialogTitle: 'Exportar Backup' });
+            } else {
+                Alert.alert('Erro', 'Compartilhamento não disponível.');
+            }
+        } catch (e) {
+            console.error(e);
+            Alert.alert('Erro', 'Não foi possível gerar o backup.');
+        }
+    };
+
+    const handleImportBackup = async () => {
+        try {
+            const result = await DocumentPicker.getDocumentAsync({
+                type: 'application/json',
+                copyToCacheDirectory: true
+            });
+
+            if (result.canceled) return;
+
+            const fileContent = await readAsStringAsync(result.assets[0].uri);
+            const backup = JSON.parse(fileContent);
+
+            if (!backup.v || (!backup.sales && !backup.inventory)) {
+                throw new Error('Formato de backup inválido.');
+            }
+
+            Alert.alert("Restaurar Backup", "Isso irá substituir todos os dados atuais. Continuar?", [
+                { text: "Cancelar" },
+                {
+                    text: "Restaurar", onPress: async () => {
+                        // Se for backup V2, processamos as fotos
+                        if (backup.v === 2 && backup.inventory) {
+                            await ensureFolders();
+                            for (const item of backup.inventory) {
+                                if (item.imageBase64) {
+                                    try {
+                                        const filename = `prod_${Date.now()}_restored.jpg`;
+                                        const permanentPath = `${documentDirectory}photos/${filename}`;
+                                        await writeAsStringAsync(permanentPath, item.imageBase64, { encoding: EncodingType.Base64 });
+                                        item.image = permanentPath;
+                                        delete item.imageBase64;
+                                    } catch (e) {
+                                        console.error("Erro ao restaurar imagem:", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Restaurar no SQLite via DatabaseService
+                        if (backup.categories) await DatabaseService.bulkSaveCategories(backup.categories);
+                        if (backup.inventory) await DatabaseService.bulkSaveInventory(backup.inventory);
+                        if (backup.sales) await DatabaseService.bulkSaveSales(backup.sales);
+
+                        // Settings continuam no AsyncStorage
+                        if (backup.settings) await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(backup.settings));
+                        if (backup.syncUrl) {
+                            await AsyncStorage.setItem(SYNC_URL_KEY, backup.syncUrl);
+                            setSyncUrl(backup.syncUrl);
+                        }
+
+                        Alert.alert("Sucesso", "Backup restaurado!", [
+                            {
+                                text: "OK", onPress: () => {
+                                    loadData();
+                                    setView('menu');
+                                }
+                            }
+                        ]);
+                    }
+                }
+            ]);
+        } catch (e) {
+            Alert.alert('Erro', 'Não foi possível importar o backup. Verifique o arquivo.');
+        }
+    };
+
+    const handleDownloadFromCloud = async () => {
+        try {
+            setIsSyncing(true);
+            const data = await SyncService.downloadData();
+
+            Alert.alert("Restaurar da Nuvem", "Isso irá substituir todos os dados atuais pelos da planilha. Continuar?", [
+                { text: "Cancelar", onPress: () => setIsSyncing(false) },
+                {
+                    text: "Restaurar", onPress: async () => {
+                        try {
+                            // 1. Limpar Tabelas Atuais
+                            const db = await initDatabase();
+                            await db.runAsync('DELETE FROM sales');
+                            await db.runAsync('DELETE FROM products');
+                            await db.runAsync('DELETE FROM categories WHERE name != "Geral"');
+                            await db.runAsync('DELETE FROM installments');
+                            await db.runAsync('DELETE FROM sale_items');
+                            await db.runAsync('DELETE FROM product_history');
+
+                            // 2. Importar Categorias
+                            if (data.categories) await DatabaseService.bulkSaveCategories(data.categories);
+
+                            // 3. Importar Produtos
+                            if (data.products) await DatabaseService.bulkSaveInventory(data.products);
+
+                            // 4. Importar Vendas (com itens e parcelas)
+                            if (data.sales) {
+                                for (const s of data.sales) {
+                                    const sale: Venda = {
+                                        ...s,
+                                        products: data.sale_items.filter((i: any) => i.sale_id === s.id),
+                                        installmentList: data.installments.filter((i: any) => i.sale_id === s.id)
+                                    };
+                                    await DatabaseService.saveSale(sale, true);
+                                }
+                            }
+
+                            Alert.alert("Sucesso", "Dados restaurados da planilha!");
+                            loadData();
+                            setView('menu');
+                        } catch (err) {
+                            Alert.alert("Erro", "Falha ao gravar dados no banco local.");
+                        } finally {
+                            setIsSyncing(false);
+                        }
+                    }
+                }
+            ]);
+        } catch (err: any) {
+            setIsSyncing(false);
+            Alert.alert("Erro na Sincronização", err.message || "Não foi possível baixar os dados.");
+        }
+    };
+
+    const handleResetData = () => {
+        Alert.alert(
+            "Limpar Tudo",
+            "Esta ação irá apagar permanentemente todas as vendas, produtos e categorias. Tem certeza?",
+            [
+                { text: "Cancelar", style: "cancel" },
+                {
+                    text: "SOU CIENTE, LIMPAR TUDO",
+                    style: "destructive",
+                    onPress: () => {
+                        Alert.alert(
+                            "CONFIRMAÇÃO FINAL",
+                            "Os dados serão perdidos para sempre se você não tiver um backup. Confirmar?",
+                            [
+                                { text: "Cancelar", style: "cancel" },
+                                {
+                                    text: "APAGAR DADOS",
+                                    style: "destructive",
+                                    onPress: async () => {
+                                        // Limpar tabelas no SQLite
+                                        const database = await DatabaseService.init(); // Garante o DB
+                                        // O DatabaseService não tem um "clearAll", vamos usar comandos simples
+                                        // mas por agora vamos focar em garantir que o estado local e o banco sejam sincronizados.
+
+                                        // Implementação rápida para limpar as tabelas principais
+                                        const db = await initDatabase();
+                                        await db.runAsync('DELETE FROM sales');
+                                        await db.runAsync('DELETE FROM products');
+                                        await db.runAsync('DELETE FROM categories WHERE name != "Geral"');
+                                        await db.runAsync('DELETE FROM installments');
+                                        await db.runAsync('DELETE FROM sale_items');
+                                        await db.runAsync('DELETE FROM product_history');
+
+                                        setSales([]);
+                                        setInventory([]);
+                                        setCategories(['Geral']);
+
+                                        // Limpar chaves antigas do AsyncStorage por segurança (embora não sejam mais as principais)
+                                        await AsyncStorage.removeItem(STORAGE_KEY);
+                                        await AsyncStorage.removeItem(INVENTORY_KEY);
+                                        await AsyncStorage.removeItem(CATEGORIES_KEY);
+
+                                        Alert.alert("Sucesso", "Todos os dados foram apagados.");
+                                        setView('menu');
+                                    }
+                                }
+                            ]
+                        );
+                    }
+                }
+            ]
+        );
+    };
+
+    // --- Views ---
+
+    if (view === 'menu') {
+        return (
+            <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                <StatusBar barStyle="dark-content" />
+                <View style={styles.header}>
+                    <TouchableOpacity onPress={toggleDrawer} style={{ position: 'absolute', top: 50, left: 20, zIndex: 10 }}>
+                        <Menu color={appTheme.primary} size={24} />
+                    </TouchableOpacity>
+                    <View style={{
+                        width: 280,
+                        height: 280,
+                        borderRadius: 140,
+                        overflow: 'hidden',
+                        backgroundColor: '#fff',
+                        justifyContent: 'center',
+                        alignItems: 'center',
+                        elevation: 5,
+                        shadowColor: '#000',
+                        shadowOffset: { width: 0, height: 2 },
+                        shadowOpacity: 0.2,
+                        shadowRadius: 4
+                    }}>
+                        <Image source={appLogo ? { uri: appLogo } : LOGO_IMAGE} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
+                    </View>
+                </View>
+                <View style={styles.menuContainer}>
+                    <TouchableOpacity style={[styles.menuBtn, { backgroundColor: appTheme.primary }]} onPress={() => setView('list')}>
+                        <ShoppingBag color="#fff" size={20} />
+                        <Text style={styles.menuBtnText}>VENDAS</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.menuBtn, { backgroundColor: appTheme.primary }]} onPress={() => setView('reports')}>
+                        <BarChart2 color="#fff" size={20} />
+                        <Text style={styles.menuBtnText}>RELATÓRIOS</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.menuBtn, { backgroundColor: appTheme.dark }]} onPress={() => setView('categories_list')}>
+                        <QrCode color="#fff" size={20} />
+                        <Text style={styles.menuBtnText}>PRODUTOS / QR</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.menuBtn, { backgroundColor: appTheme.primary }]} onPress={() => setView('settings')}>
+                        <Settings color="#fff" size={20} />
+                        <Text style={styles.menuBtnText}>CONFIGURAÇÕES</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.menuBtn, { backgroundColor: appTheme.light, marginTop: 10 }]} onPress={() => BackHandler.exitApp()}>
+                        <LogOut color="#fff" size={20} />
+                        <Text style={styles.menuBtnText}>SAIR</Text>
+                    </TouchableOpacity>
+                </View>
+            </SafeAreaView>
+        );
+    }
+
+
+
+    if (view === 'categories_list') {
+        return (
+            <ThemeBarWrapper primaryColor={appTheme.primary}>
+                <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                    <View style={styles.topBar}>
+                        <TouchableOpacity onPress={toggleDrawer}><Menu color={appTheme.primary} size={32} /></TouchableOpacity>
+                        <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>PRODUTOS / QR</Text>
+                        <View style={{ flexDirection: 'row', gap: 15 }}>
+                            <TouchableOpacity onPress={() => setShowPrintQueueModal(true)}>
+                                <View>
+                                    <FileText color={appTheme.primary} size={28} />
+                                    {printQueue.length > 0 && (
+                                        <View style={{
+                                            position: 'absolute',
+                                            top: -5,
+                                            right: -5,
+                                            backgroundColor: '#ff4d4d',
+                                            borderRadius: 10,
+                                            width: 18,
+                                            height: 18,
+                                            justifyContent: 'center',
+                                            alignItems: 'center'
+                                        }}>
+                                            <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{printQueue.length}</Text>
+                                        </View>
+                                    )}
+                                </View>
+                            </TouchableOpacity>
+                            <TouchableOpacity onPress={async () => {
+                                if (!permission?.granted) await requestPermission();
+                                setScanning(true);
+                            }}><Scan color={appTheme.primary} size={28} /></TouchableOpacity>
+                        </View>
+                    </View>
+
+                    {/* Barra de Categorias */}
+                    <View style={styles.catBarWrapper}>
+                        <View style={[styles.catHeader, { backgroundColor: appTheme.dark }]}>
+                            <TouchableOpacity style={[styles.catControlBtn, { backgroundColor: appTheme.primary }]} onPress={() => setShowCategoryModal(true)}>
+                                <Plus color="#fff" size={20} />
+                            </TouchableOpacity>
+                            <Text style={styles.catHeaderTitle}>CATEGORIAS</Text>
+                            <TouchableOpacity style={[styles.catControlBtn, { backgroundColor: '#d32f2f' }]} onPress={handleDeleteCategory}>
+                                <Trash2 color="#fff" size={18} />
+                            </TouchableOpacity>
+                        </View>
+                        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.catScroll}>
+                            {categories.map(c => (
+                                <TouchableOpacity
+                                    key={c}
+                                    style={[styles.catChip, selectedCategory === c && { backgroundColor: appTheme.primary, borderColor: appTheme.primary }]}
+                                    onPress={() => setSelectedCategory(c)}
+                                >
+                                    <Text style={[styles.catChipText, selectedCategory === c && { color: '#fff' }]}>{c}</Text>
+                                </TouchableOpacity>
+                            ))}
+                        </ScrollView>
+                    </View>
+
+                    {isSearching && (
+                        <View style={styles.searchBar}>
+                            <Search size={20} color="#666" style={{ marginLeft: 10 }} />
+                            <TextInput
+                                style={styles.searchInput}
+                                placeholder="Pesquisar por nome ou preço..."
+                                value={searchQuery}
+                                onChangeText={setSearchQuery}
+                                autoFocus
+                            />
+                            <TouchableOpacity onPress={() => setSearchQuery('')}>
+                                <X size={20} color="#666" style={{ marginRight: 10 }} />
+                            </TouchableOpacity>
+                        </View>
+                    )}
+
+                    <FlatList
+                        data={filteredInventory}
+                        keyExtractor={(item) => item.id}
+                        style={styles.scroll}
+                        ListEmptyComponent={<View style={styles.empty}><Package color="#ccc" size={64} /><Text>Nenhum produto nesta categoria.</Text></View>}
+                        ListFooterComponent={<View style={{ height: 100 }} />}
+                        renderItem={({ item }) => (
+                            <InventoryItem
+                                item={item}
+                                theme={appTheme}
+                                onPreview={setSelectedImage}
+                                onEdit={(p: any, mode: string) => {
+                                    if (mode === 'qr') {
+                                        setQrProductForModal(p);
+                                        setShowQrOptionsModal(true);
+                                    } else {
+                                        openQrForm(p);
+                                    }
+                                }}
+                                onDelete={handleDeleteProduct}
+                                onAddToQueue={togglePrintQueue}
+                                isInQueue={printQueue.some(q => q.id === item.id)}
+                            />
+                        )}
+                    />
+
+                    <TouchableOpacity style={[styles.fab, { backgroundColor: appTheme.primary }]} onPress={() => {
+                        setProdCategory(selectedCategory);
+                        openQrForm();
+                    }}><Plus color="#fff" size={32} /></TouchableOpacity>
+
+                    <TouchableOpacity
+                        style={[styles.fab, { left: 20, backgroundColor: '#fff', borderWidth: 2, borderColor: appTheme.primary }]}
+                        onPress={() => {
+                            setIsSearching(!isSearching);
+                            if (isSearching) setSearchQuery('');
+                        }}
+                    >
+                        <Search color={appTheme.primary} size={32} />
+                    </TouchableOpacity>
+
+                    {/* Modal Nova Categoria */}
+                    <Modal visible={showCategoryModal} transparent animationType="fade">
+                        <View style={styles.modalBack}>
+                            <View style={styles.scanResultCard}>
+                                <Text style={styles.scanResTitle}>NOVA CATEGORIA</Text>
+                                <TextInput
+                                    style={[styles.input, { width: '100%' }]}
+                                    placeholder="Nome da Categoria"
+                                    value={newCategoryName}
+                                    onChangeText={setNewCategoryName}
+                                    autoFocus
+                                />
+                                <View style={{ flexDirection: 'row', gap: 10, marginTop: 10, width: '100%' }}>
+                                    <TouchableOpacity style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]} onPress={() => setShowCategoryModal(false)}>
+                                        <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary }]} onPress={handleAddCategory}>
+                                        <Text style={{ fontWeight: 'bold', color: '#fff' }}>CRIAR</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            </View>
+                        </View>
+                    </Modal>
+
+                    {scanning && (
+                        <Modal animationType="slide" transparent={false} visible={scanning}>
+                            <View style={{ flex: 1, backgroundColor: '#000' }}>
+                                <CameraView style={{ flex: 1 }} onBarcodeScanned={handleBarCodeScanned} />
+                                <TouchableOpacity style={styles.closeScan} onPress={() => setScanning(false)}><X color="#fff" size={32} /></TouchableOpacity>
+                                <View style={styles.scanOverlay}><View style={styles.scanVez} /></View>
+                            </View>
+                        </Modal>
+                    )}
+                    {/* Modal Opções de QR */}
+                    <Modal visible={showQrOptionsModal} transparent animationType="fade">
+                        <View style={styles.modalBack}>
+                            <View style={styles.scanResultCard}>
+                                <Text style={styles.scanResTitle}>OPÇÕES DO QR CODE</Text>
+                                <Text style={{ marginBottom: 15, textAlign: 'center', color: '#666' }}>Escolha o que incluir na etiqueta:</Text>
+
+                                <TouchableOpacity
+                                    style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 20, padding: 10, alignSelf: 'center' }}
+                                    onPress={() => setQrIncludePrice(!qrIncludePrice)}
+                                >
+                                    {qrIncludePrice ? <CheckSquare size={24} color={appTheme.primary} /> : <Square size={24} color="#ccc" />}
+                                    <Text style={{ marginLeft: 10, fontSize: 18, color: appTheme.dark }}>Incluir Valor (Preço)</Text>
+                                </TouchableOpacity>
+
+                                <View style={{ flexDirection: 'row', gap: 10, width: '100%' }}>
+                                    <TouchableOpacity
+                                        style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]}
+                                        onPress={() => setShowQrOptionsModal(false)}
+                                    >
+                                        <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary }]}
+                                        onPress={() => {
+                                            if (qrProductForModal) {
+                                                generateTagPDF(qrProductForModal, qrIncludePrice);
+                                            }
+                                            setShowQrOptionsModal(false);
+                                        }}
+                                    >
+                                        <Text style={{ fontWeight: 'bold', color: '#fff' }}>GERAR PDF</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            </View>
+                        </View>
+                    </Modal>
+
+                    {/* Modal Fila de Impressão */}
+                    <Modal visible={showPrintQueueModal} transparent animationType="slide">
+                        <View style={styles.modalBack}>
+                            <View style={[styles.scanResultCard, { maxHeight: '80%', width: '90%' }]}>
+                                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', marginBottom: 15 }}>
+                                    <Text style={styles.scanResTitle}>FILA DE IMPRESSÃO</Text>
+                                    <TouchableOpacity onPress={() => setShowPrintQueueModal(false)}>
+                                        <X size={24} color="#666" />
+                                    </TouchableOpacity>
+                                </View>
+
+                                <Text style={{ marginBottom: 10, textAlign: 'center', color: '#666' }}>Escolha o que incluir na etiqueta:</Text>
+
+                                <View style={{ gap: 10, marginBottom: 20 }}>
+                                    <TouchableOpacity
+                                        style={{ flexDirection: 'row', alignItems: 'center', padding: 5, alignSelf: 'center' }}
+                                        onPress={() => setBatchQrIncludePrice(!batchQrIncludePrice)}
+                                    >
+                                        {batchQrIncludePrice ? <CheckSquare size={24} color={appTheme.primary} /> : <Square size={24} color="#ccc" />}
+                                        <Text style={{ marginLeft: 10, fontSize: 18, color: appTheme.dark }}>Valor (Preço)</Text>
+                                    </TouchableOpacity>
+
+                                    <TouchableOpacity
+                                        style={{ flexDirection: 'row', alignItems: 'center', padding: 5, alignSelf: 'center' }}
+                                        onPress={() => setBatchQrIncludeName(!batchQrIncludeName)}
+                                    >
+                                        {batchQrIncludeName ? <CheckSquare size={24} color={appTheme.primary} /> : <Square size={24} color="#ccc" />}
+                                        <Text style={{ marginLeft: 10, fontSize: 18, color: appTheme.dark }}>Titulo (Produto)</Text>
+                                    </TouchableOpacity>
+                                </View>
+
+                                {printQueue.length === 0 ? (
+                                    <View style={{ padding: 20, alignItems: 'center' }}>
+                                        <FileText size={48} color="#ccc" />
+                                        <Text style={{ marginTop: 10, color: '#999' }}>A fila está vazia.</Text>
+                                    </View>
+                                ) : (
+                                    <>
+                                        <ScrollView style={{ width: '100%', marginBottom: 15 }}>
+                                            {printQueue.map(item => (
+                                                <View key={item.id} style={[styles.row, { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eee' }]}>
+                                                    <View style={{ flex: 1 }}>
+                                                        <Text style={{ fontWeight: 'bold' }}>{item.name}</Text>
+                                                        <Text style={{ fontSize: 12, color: '#666' }}>R$ {item.price.replace('.', ',')}</Text>
+                                                    </View>
+                                                    <TouchableOpacity onPress={() => togglePrintQueue(item)}>
+                                                        <Trash2 size={20} color="#ff4d4d" />
+                                                    </TouchableOpacity>
+                                                </View>
+                                            ))}
+                                        </ScrollView>
+
+                                        <View style={{ flexDirection: 'row', gap: 10, width: '100%' }}>
+                                            <TouchableOpacity
+                                                style={[styles.resBtn, { backgroundColor: '#ff4d4d', flex: 1 }]}
+                                                onPress={() => setPrintQueue([])}
+                                            >
+                                                <Text style={{ fontWeight: 'bold', color: '#fff' }}>LIMPAR</Text>
+                                            </TouchableOpacity>
+                                            <TouchableOpacity
+                                                style={[styles.resBtn, { backgroundColor: appTheme.primary, flex: 2 }]}
+                                                onPress={() => {
+                                                    generateBatchPDF();
+                                                    setShowPrintQueueModal(false);
+                                                }}
+                                            >
+                                                <Text style={{ fontWeight: 'bold', color: '#fff' }}>GERAR PDF A4</Text>
+                                            </TouchableOpacity>
+                                        </View>
+                                    </>
+                                )}
+                            </View>
+                        </View>
+                    </Modal>
+
+                    {scannedItem && (
+                        <Modal transparent visible={!!scannedItem} animationType="fade">
+                            <View style={styles.modalBack}>
+                                <View style={styles.scanResultCard}>
+                                    <Text style={styles.scanResTitle}>DETALHES DO PRODUTO</Text>
+                                    {scannedItem.image && (
+                                        <TouchableOpacity onPress={() => setSelectedImage(scannedItem.image)}>
+                                            <Image source={{ uri: scannedItem.image }} style={styles.resImg} />
+                                        </TouchableOpacity>
+                                    )}
+                                    <Text style={styles.resName}>{scannedItem.name}</Text>
+                                    <Text style={[styles.resPrice, { color: appTheme.primary }]}>R$ {scannedItem.price.replace('.', ',')}</Text>
+                                    <View style={{ gap: 10, width: '100%', marginTop: 10 }}>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { backgroundColor: appTheme.primary }]}
+                                            onPress={() => {
+                                                setSelectedCategory(scannedItem.category || 'Geral');
+                                                setScannedItem(null);
+                                            }}
+                                        >
+                                            <Text style={{ color: '#fff', fontWeight: 'bold' }}>FECHAR</Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { backgroundColor: '#ccc' }]}
+                                            onPress={() => {
+                                                const item = scannedItem;
+                                                setScannedItem(null);
+                                                openQrForm(item);
+                                            }}
+                                        >
+                                            <Text style={{ color: '#333', fontWeight: 'bold' }}>EDITAR</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            </View>
+                        </Modal>
+                    )}
+
+                    {selectedImage && (
+                        <Modal transparent visible={!!selectedImage} animationType="fade">
+                            <View style={styles.previewContainer}>
+                                <TouchableOpacity style={styles.previewClose} onPress={() => setSelectedImage(null)}>
+                                    <X color="#fff" size={32} />
+                                </TouchableOpacity>
+                                <Image source={{ uri: selectedImage }} style={styles.previewImage} resizeMode="contain" />
+                                <TouchableOpacity
+                                    style={styles.previewShare}
+                                    onPress={() => handleShareImage(selectedImage)}
+                                >
+                                    <Share2 color="#fff" size={24} />
+                                    <Text style={{ color: '#fff', fontWeight: 'bold', marginLeft: 10 }}>COMPARTILHAR FOTO</Text>
+                                </TouchableOpacity>
+                            </View>
+                        </Modal>
+                    )}
+                </SafeAreaView>
+                {isDrawerOpen && <TouchableOpacity activeOpacity={1} style={styles.drawerOverlay} onPress={toggleDrawer} />}
+                {renderDrawer()}
+            </ThemeBarWrapper>
+        );
+    }
+    if (view === 'qr_form') {
+        return (
+            <ThemeBarWrapper primaryColor={appTheme.primary}>
+                <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+                        <View style={styles.topBar}>
+                            <TouchableOpacity onPress={() => setView('categories_list')}><ChevronLeft color={appTheme.primary} size={32} /></TouchableOpacity>
+                            <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>PRODUTO</Text><View style={{ width: 32 }} />
+                        </View>
+                        <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
+                            <View style={styles.formCard}>
+                                <Text style={[styles.label, { color: appTheme.primary }]}>NOME DO PRODUTO</Text>
+                                <TextInput style={styles.input} placeholder="Ex: Vestido Floral" value={prodName} onChangeText={setProdName} />
+                                <Text style={[styles.label, { color: appTheme.primary }]}>VALOR (R$)</Text>
+                                <TextInput style={styles.input} placeholder="0.00" keyboardType="default" value={prodPrice.replace('.', ',')} onChangeText={v => setProdPrice(v.replace(',', '.'))} />
+
+                                <Text style={[styles.label, { color: appTheme.primary }]}>CATEGORIA</Text>
+                                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 15 }}>
+                                    {categories.map(c => (
+                                        <TouchableOpacity
+                                            key={c}
+                                            style={[styles.catChip, prodCategory === c && { backgroundColor: appTheme.primary, borderColor: appTheme.primary }, { marginRight: 8 }]}
+                                            onPress={() => setProdCategory(c)}
+                                        >
+                                            <Text style={[styles.catChipText, prodCategory === c && { color: '#fff' }]}>{c}</Text>
+                                        </TouchableOpacity>
+                                    ))}
+                                </ScrollView>
+
+                                <Text style={[styles.label, { color: appTheme.primary }]}>ESTOQUE</Text>
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 15 }}>
+                                    <View style={[styles.input, { flex: 1, marginBottom: 0, justifyContent: 'center' }]}>
+                                        <Text style={{ fontSize: 16 }}>{prodStock}</Text>
+                                    </View>
+                                    <TouchableOpacity
+                                        style={[styles.stockControlBtn, { backgroundColor: '#f0f0f0' }]}
+                                        onPress={() => { setStockModalType('input'); setShowStockModal(true); }}
+                                    >
+                                        <Text style={[styles.stockControlBtnText, { color: appTheme.primary }]}>Entrada</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        style={[styles.stockControlBtn, { backgroundColor: appTheme.primary }]}
+                                        onPress={() => { setStockModalType('output'); setShowStockModal(true); }}
+                                    >
+                                        <Text style={[styles.stockControlBtnText, { color: '#fff' }]}>Saída</Text>
+                                    </TouchableOpacity>
+                                </View>
+
+                                <TouchableOpacity
+                                    style={[styles.reportBtn, { borderColor: appTheme.primary }]}
+                                    onPress={() => generateProductHistoryPDF(editingProduct!)}
+                                    disabled={!editingProduct}
+                                >
+                                    <FileText size={20} color={appTheme.primary} />
+                                    <Text style={[styles.reportBtnText, { color: appTheme.primary }]}>RELATÓRIO</Text>
+                                </TouchableOpacity>
+
+                                <TouchableOpacity style={[styles.photoBtn, { borderColor: appTheme.primary, marginTop: 15 }]} onPress={handlePickImage}><Camera size={24} color={appTheme.primary} /><Text style={[styles.photoBtnText, { color: appTheme.primary }]}>{prodImage ? 'TROCAR FOTO' : 'TIRAR FOTO DO PRODUTO'}</Text></TouchableOpacity>
+                                {prodImage && (
+                                    <View style={styles.formImgPrev}>
+                                        <Text style={{ color: appTheme.primary, fontWeight: 'bold', fontSize: 10, textAlign: 'center', marginBottom: 5 }}>FOTO CAPTURADA! ✅</Text>
+                                        <Image source={{ uri: prodImage }} style={{ width: '100%', height: 200, borderRadius: 10 }} />
+                                        <TouchableOpacity style={styles.remImg} onPress={() => setProdImage(null)}><X color="#fff" size={16} /></TouchableOpacity>
+                                    </View>
+                                )}
+                            </View>
+                            <TouchableOpacity style={[styles.saveBtn, { backgroundColor: appTheme.primary }]} onPress={handleSaveProduct}><Save size={24} color="#fff" /><Text style={styles.saveBtnText}>SALVAR E LISTAR</Text></TouchableOpacity>
+                        </ScrollView>
+
+                        {/* Modal de Ajuste de Estoque */}
+                        <Modal visible={showStockModal} transparent animationType="fade">
+                            <View style={styles.modalBack}>
+                                <View style={styles.scanResultCard}>
+                                    <Text style={styles.scanResTitle}>{stockModalType === 'input' ? 'ENTRADA DE ESTOQUE' : 'SAÍDA DE ESTOQUE'}</Text>
+                                    <TextInput
+                                        style={[styles.input, { width: '100%', textAlign: 'center', fontSize: 24 }]}
+                                        placeholder="0"
+                                        keyboardType="number-pad"
+                                        value={stockAdjustment}
+                                        onChangeText={setStockAdjustment}
+                                        autoFocus
+                                    />
+                                    <View style={{ flexDirection: 'row', gap: 10, marginTop: 10, width: '100%' }}>
+                                        <TouchableOpacity style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]} onPress={() => { setShowStockModal(false); setStockAdjustment(''); }}>
+                                            <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary }]} onPress={handleStockAdjustment}>
+                                            <Text style={{ fontWeight: 'bold', color: '#fff' }}>CONFIRMAR</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            </View>
+                        </Modal>
+                    </KeyboardAvoidingView>
+                </SafeAreaView>
+            </ThemeBarWrapper>
+        );
+    }
+
+    if (view === 'list') {
+        return (
+            <ThemeBarWrapper primaryColor={appTheme.primary}>
+                <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                    <View style={styles.topBar}>
+                        <TouchableOpacity onPress={toggleDrawer}><Menu color={appTheme.primary} size={32} /></TouchableOpacity>
+                        <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>VENDAS</Text><View style={{ width: 32 }} />
+                    </View>
+
+                    {isSaleSearching && (
+                        <View style={styles.searchBar}>
+                            <Search size={20} color="#666" style={{ marginLeft: 10 }} />
+                            <TextInput
+                                style={styles.searchInput}
+                                placeholder="Pesquisar cliente ou produto..."
+                                value={saleSearchQuery}
+                                onChangeText={setSaleSearchQuery}
+                                autoFocus
+                            />
+                            <TouchableOpacity onPress={() => setSaleSearchQuery('')}>
+                                <X size={20} color="#666" style={{ marginRight: 10 }} />
+                            </TouchableOpacity>
+                        </View>
+                    )}
+
+                    <FlatList
+                        data={filteredSales}
+                        keyExtractor={(item) => item.id}
+                        style={styles.scroll}
+                        ListEmptyComponent={<View style={styles.empty}><ShoppingBag color="#ccc" size={64} /><Text>Nenhuma venda regristrada.</Text></View>}
+                        ListFooterComponent={<View style={{ height: 100 }} />}
+                        renderItem={({ item }) => (
+                            <SaleItem
+                                item={item}
+                                theme={appTheme}
+                                onEdit={openSaleForm}
+                                onDelete={handleDeleteSale}
+                                onToggleStatus={togglePaymentStatus}
+                                getStatusInfo={getStatusInfo}
+                            />
+                        )}
+                    />
+                    <TouchableOpacity style={[styles.fab, { backgroundColor: appTheme.primary }]} onPress={() => openSaleForm()}><Plus color="#fff" size={32} /></TouchableOpacity>
+                    <TouchableOpacity
+                        style={[styles.fab, { left: 20, backgroundColor: '#fff', borderWidth: 2, borderColor: appTheme.primary }]}
+                        onPress={() => {
+                            setIsSaleSearching(!isSaleSearching);
+                            if (isSaleSearching) setSaleSearchQuery('');
+                        }}
+                    >
+                        <Search color={appTheme.primary} size={32} />
+                    </TouchableOpacity>
+                </SafeAreaView>
+                {isDrawerOpen && <TouchableOpacity activeOpacity={1} style={styles.drawerOverlay} onPress={toggleDrawer} />}
+                {renderDrawer()}
+            </ThemeBarWrapper>
+        );
+    }
+
+    if (view === 'form') {
+        return (
+            <ThemeBarWrapper primaryColor={appTheme.primary}>
+                <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+                        <View style={styles.topBar}>
+                            <TouchableOpacity onPress={() => setView('list')}><ChevronLeft color={appTheme.primary} size={32} /></TouchableOpacity>
+                            <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>{editingSale ? 'EDITAR' : 'NOVA VENDA'}</Text><View style={{ width: 32 }} />
+                        </View>
+                        <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled"
+                            contentContainerStyle={{ paddingBottom: 100 }}>
+                            <View style={styles.formCard}>
+                                <Text style={[styles.label, { color: appTheme.primary }]}>CLIENTE</Text>
+                                <TextInput
+                                    style={styles.input}
+                                    value={client}
+                                    onChangeText={(v) => {
+                                        setClient(v);
+                                        setShowClientSuggestions(true);
+                                    }}
+                                    onFocus={() => setShowClientSuggestions(true)}
+                                />
+                                {showClientSuggestions && filteredClients.length > 0 && (
+                                    <View style={styles.suggestionsContainer}>
+                                        <ScrollView horizontal={false} keyboardShouldPersistTaps="always" style={{ maxHeight: 150 }}>
+                                            {filteredClients.map((c, i) => (
+                                                <TouchableOpacity
+                                                    key={i}
+                                                    style={styles.suggestionItem}
+                                                    onPress={() => {
+                                                        setClient(c);
+                                                        setShowClientSuggestions(false);
+                                                    }}
+                                                >
+                                                    <User size={14} color={appTheme.primary} />
+                                                    <Text style={styles.suggestionText}>{c}</Text>
+                                                </TouchableOpacity>
+                                            ))}
+                                        </ScrollView>
+                                    </View>
+                                )}
+                                <Text style={[styles.label, { color: appTheme.primary }]}>DATA</Text>
+                                <TextInput style={styles.input} value={date} onChangeText={setDate} />
+                            </View>
+                            <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 10, marginTop: 10 }}>
+                                <Text style={[styles.label, { color: appTheme.primary, flex: 3 }]}>PRODUTOS</Text>
+                                <Text style={[styles.label, { color: appTheme.primary, flex: 1, textAlign: 'center' }]}>Qt</Text>
+                                <Text style={[styles.label, { color: appTheme.primary, flex: 2, textAlign: 'center', marginRight: products.length > 1 ? 40 : 10 }]}>VALOR</Text>
+                            </View>
+                            {products.map((p, i) => (
+                                <View key={i} style={styles.prodForm}>
+                                    <TextInput style={[styles.input, { flex: 3, marginBottom: 0 }]} placeholder="Nome do Produto" value={p.name} onChangeText={v => handleUpdateProductInSale(i, 'name', v)} />
+                                    <TextInput style={[styles.input, { flex: 1, marginBottom: 0, textAlign: 'center' }]} placeholder="1" keyboardType="number-pad" value={p.quantity} onChangeText={v => handleUpdateProductInSale(i, 'quantity', v)} />
+                                    <TextInput style={[styles.input, { flex: 2, marginBottom: 0, textAlign: 'center' }]} placeholder="R$ 0,00" keyboardType="default" value={p.price.replace('.', ',')} onChangeText={v => handleUpdateProductInSale(i, 'price', v)} />
+                                    {products.length > 1 && (
+                                        <TouchableOpacity onPress={() => setProducts(products.filter((_, idx) => idx !== i))} style={styles.trashBtn}>
+                                            <Trash2 size={20} color="#ff4d4d" />
+                                        </TouchableOpacity>
+                                    )}
+                                </View>
+                            ))}
+                            <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center', marginBottom: 15 }}>
+                                <TouchableOpacity onPress={() => setProducts([...products, { name: '', price: '', quantity: '1' }])} style={[styles.addBtn, { flex: 1, backgroundColor: appTheme.primary }]}>
+                                    <Plus size={20} color="#fff" />
+                                    <Text style={styles.addBtnText}>ADICIONAR ITEM</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity onPress={() => { setScanningForSale(true); setScanning(true); }} style={[styles.addBtn, { flex: 0, width: 60, backgroundColor: appTheme.primary, justifyContent: 'center' }]}>
+                                    <Text style={{ color: '#fff', fontWeight: 'bold' }}>QR</Text>
+                                </TouchableOpacity>
+                            </View>
+
+                            <View style={styles.formCard}>
+                                <Text style={[styles.label, { color: appTheme.primary }]}>PAGAMENTO</Text>
+                                <View style={styles.payToggle}>
+                                    <TouchableOpacity onPress={() => setPaymentType('vista')} style={[styles.tBtn, paymentType === 'vista' && { backgroundColor: appTheme.primary }]}><Text style={{ color: paymentType === 'vista' ? '#fff' : '#666' }}>À VISTA</Text></TouchableOpacity>
+                                    <TouchableOpacity onPress={() => setPaymentType('parcelado')} style={[styles.tBtn, paymentType === 'parcelado' && { backgroundColor: appTheme.primary }]}><Text style={{ color: paymentType === 'parcelado' ? '#fff' : '#666' }}>PARCELADO</Text></TouchableOpacity>
+                                </View>
+                                {paymentType === 'parcelado' && (
+                                    <View style={{ marginTop: 15 }}>
+                                        <Text style={[styles.label, { color: appTheme.primary }]}>PARCELAS</Text>
+                                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                                            <TouchableOpacity onPress={() => setShowPicker(!showPicker)} style={[styles.pickerB, { flex: 1 }]}><Text>{installments}x</Text><ChevronDown size={16} /></TouchableOpacity>
+                                            <TouchableOpacity
+                                                onPress={() => setShowInstallmentsEditor(!showInstallmentsEditor)}
+                                                style={[styles.stockControlBtn, { backgroundColor: '#f0f0f0', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center' }]}
+                                            >
+                                                <ChevronDown size={24} color={appTheme.primary} style={{ transform: [{ rotate: showInstallmentsEditor ? '180deg' : '0deg' }] }} />
+                                            </TouchableOpacity>
+                                        </View>
+                                        {showPicker && <View style={styles.pickerO}>{[1, 2, 3, 4, 5, 6, 12].map(n => <TouchableOpacity key={n} onPress={() => { setInstallments(n.toString()); setShowPicker(false) }} style={{ padding: 10 }}><Text>{n}x</Text></TouchableOpacity>)}</View>}
+
+                                        {showInstallmentsEditor && (
+                                            <View style={{ marginTop: 10, padding: 10, backgroundColor: '#fff', borderRadius: 10, borderWidth: 1, borderColor: '#eee' }}>
+                                                {installmentList.map((inst, idx) => (
+                                                    <View key={idx} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8, backgroundColor: '#f9f9f9', padding: 8, borderRadius: 8 }}>
+                                                        <View style={{ backgroundColor: appTheme.primary, width: 24, height: 24, borderRadius: 12, justifyContent: 'center', alignItems: 'center' }}>
+                                                            <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{inst.number}º</Text>
+                                                        </View>
+                                                        <TextInput
+                                                            style={[styles.input, { flex: 2, marginBottom: 0, fontSize: 12, backgroundColor: '#fff' }]}
+                                                            value={inst.date}
+                                                            onChangeText={(v) => handleUpdateInstallment(idx, 'date', v)}
+                                                            placeholder="YYYY-MM-DD"
+                                                        />
+                                                        <View style={[styles.input, { flex: 1.5, marginBottom: 0, flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', paddingHorizontal: 5 }]}>
+                                                            <Text style={{ fontSize: 10, color: '#666' }}>R$</Text>
+                                                            <TextInput
+                                                                style={{ flex: 1, fontSize: 12, paddingLeft: 5 }}
+                                                                value={inst.value.toFixed(2).replace('.', ',')}
+                                                                onChangeText={(v) => handleUpdateInstallment(idx, 'value', v)}
+                                                                keyboardType="numeric"
+                                                            />
+                                                        </View>
+                                                    </View>
+                                                ))}
+                                            </View>
+                                        )}
+                                    </View>
+                                )}
+                            </View>
+                            <TouchableOpacity style={[styles.saveBtn, { backgroundColor: appTheme.primary }]} onPress={handleSaveSale}><Save size={24} color="#fff" /><Text style={styles.saveBtnText}>SALVAR</Text></TouchableOpacity>
+                        </ScrollView>
+                    </KeyboardAvoidingView>
+                    {scanning && (
+                        <Modal animationType="slide" transparent={false} visible={scanning}>
+                            <View style={{ flex: 1, backgroundColor: '#000' }}>
+                                <CameraView style={{ flex: 1 }} onBarcodeScanned={handleBarCodeScanned} />
+                                <TouchableOpacity style={styles.closeScan} onPress={() => { setScanning(false); setScanningForSale(false); }}><X color="#fff" size={32} /></TouchableOpacity>
+                                <View style={styles.scanOverlay}><View style={styles.scanVez} /></View>
+                            </View>
+                        </Modal>
+                    )}
+                </SafeAreaView>
+            </ThemeBarWrapper>
+        );
+    }
+
+    if (view === 'reports') {
+        const filt = filteredInstallments;
+        const tot = calculateReportTotal;
+        return (
+            <ThemeBarWrapper primaryColor={appTheme.primary}>
+                <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                    <View style={styles.topBar}>
+                        <TouchableOpacity onPress={toggleDrawer}><Menu color={appTheme.primary} size={32} /></TouchableOpacity>
+                        <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>RELATÓRIOS</Text>
+                        <TouchableOpacity onPress={generateReportPDF}><Download color={appTheme.primary} size={24} /></TouchableOpacity>
+                    </View>
+
+                    {isReportSearching && (
+                        <View style={styles.searchBar}>
+                            <Search size={20} color="#666" style={{ marginLeft: 10 }} />
+                            <TextInput
+                                style={styles.searchInput}
+                                placeholder="Pesquisar cliente..."
+                                value={reportSearchQuery}
+                                onChangeText={setReportSearchQuery}
+                                autoFocus
+                            />
+                            <TouchableOpacity onPress={() => setReportSearchQuery('')}>
+                                <X size={20} color="#666" style={{ marginRight: 10 }} />
+                            </TouchableOpacity>
+                        </View>
+                    )}
+
+                    <View style={styles.repTabs}>
+                        <TouchableOpacity onPress={() => { setReportFilter('pagas'); setReportSearchQuery(''); }} style={[styles.repTab, reportFilter === 'pagas' && { backgroundColor: appTheme.primary }]}><Text style={[styles.repTabText, { color: reportFilter === 'pagas' ? '#fff' : appTheme.primary }]} numberOfLines={1}>PAGAS</Text></TouchableOpacity>
+                        <TouchableOpacity onPress={() => { setReportFilter('atrasadas'); setReportSearchQuery(''); }} style={[styles.repTab, reportFilter === 'atrasadas' && { backgroundColor: appTheme.primary }]}><Text style={[styles.repTabText, { color: reportFilter === 'atrasadas' ? '#fff' : appTheme.primary }]} numberOfLines={1}>ATRASADAS</Text></TouchableOpacity>
+                        <TouchableOpacity onPress={() => { setReportFilter('apagar'); setReportSearchQuery(''); }} style={[styles.repTab, reportFilter === 'apagar' && { backgroundColor: appTheme.primary }]}><Text style={[styles.repTabText, { color: reportFilter === 'apagar' ? '#fff' : appTheme.primary }]} numberOfLines={1}>A PAGAR</Text></TouchableOpacity>
+                    </View>
+                    <FlatList
+                        data={filt}
+                        keyExtractor={(it, i) => i.toString()}
+                        style={styles.scroll}
+                        ListEmptyComponent={<View style={styles.empty}><FileText size={48} color="#ccc" /><Text>Nada aqui.</Text></View>}
+                        ListFooterComponent={<View style={{ height: 100 }} />}
+                        renderItem={({ item }) => (
+                            <ReportRecord item={item} theme={appTheme} />
+                        )}
+                    />
+                    <View style={styles.repFooter}><Text>TOTAL: </Text><Text style={{ fontSize: 22, fontWeight: 'bold', color: appTheme.primary }}>R$ {tot.toFixed(2).replace('.', ',')}</Text></View>
+
+                    <TouchableOpacity
+                        style={[styles.fab, { left: 20, backgroundColor: '#fff', borderWidth: 2, borderColor: appTheme.primary }]}
+                        onPress={() => {
+                            setIsReportSearching(!isReportSearching);
+                            if (isReportSearching) setReportSearchQuery('');
+                        }}
+                    >
+                        <Search color={appTheme.primary} size={32} />
+                    </TouchableOpacity>
+                </SafeAreaView>
+                {isDrawerOpen && <TouchableOpacity activeOpacity={1} style={styles.drawerOverlay} onPress={toggleDrawer} />}
+                {renderDrawer()}
+            </ThemeBarWrapper>
+        );
+    }
+
+    if (view === 'settings') {
+        return (
+            <ThemeBarWrapper primaryColor={appTheme.primary}>
+                <SafeAreaView style={[styles.container, { backgroundColor: appTheme.background }]}>
+                    <View style={styles.topBar}>
+                        <TouchableOpacity onPress={toggleDrawer}><Menu color={appTheme.primary} size={32} /></TouchableOpacity>
+                        <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>CONFIGURAÇÕES</Text><View style={{ width: 32 }} />
+                    </View>
+                    <ScrollView style={styles.scroll}>
+                        <View style={styles.formCard}>
+                            <Text style={[styles.label, { color: appTheme.primary }]}>NOME DO ATELIER</Text>
+                            <TextInput
+                                style={styles.input}
+                                placeholder="Ex: ATELIÊ S'COUTO"
+                                value={appAtelierName}
+                                onChangeText={(v) => {
+                                    setAppAtelierName(v);
+                                    saveSettings(appLogo, appTheme, v);
+                                }}
+                            />
+                        </View>
+
+                        <View style={styles.formCard}>
+                            <Text style={[styles.label, { color: appTheme.primary }]}>LOGOTIPO DA MARCA</Text>
+                            <View style={{ alignItems: 'center', marginVertical: 20 }}>
+                                <View style={{
+                                    width: 200,
+                                    height: 200,
+                                    borderRadius: 100,
+                                    overflow: 'hidden',
+                                    backgroundColor: '#fff',
+                                    borderWidth: 2,
+                                    borderColor: appTheme.light
+                                }}>
+                                    <Image source={appLogo ? { uri: appLogo } : LOGO_IMAGE} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
+                                </View>
+                            </View>
+                            <TouchableOpacity style={[styles.photoBtn, { borderColor: appTheme.primary }]} onPress={handlePickLogo}>
+                                <Camera size={24} color={appTheme.primary} />
+                                <Text style={[styles.photoBtnText, { color: appTheme.primary }]}>TROCAR LOGO</Text>
+                            </TouchableOpacity>
+                            {appLogo && (
+                                <TouchableOpacity style={{ marginTop: 10, alignSelf: 'center' }} onPress={() => { setAppLogo(null); saveSettings(null, appTheme, appAtelierName); }}>
+                                    <Text style={{ color: '#ff4d4d', fontSize: 12, fontWeight: 'bold' }}>RESTAURAR LOGO PADRÃO</Text>
+                                </TouchableOpacity>
+                            )}
+                        </View>
+
+                        <View style={styles.formCard}>
+                            <Text style={[styles.label, { color: appTheme.primary }]}>CORES E TEMAS</Text>
+                            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 15, marginTop: 15, justifyContent: 'center' }}>
+                                {DEFAULT_THEMES.map(theme => (
+                                    <TouchableOpacity
+                                        key={theme.id}
+                                        style={{
+                                            width: 80,
+                                            height: 80,
+                                            borderRadius: 15,
+                                            backgroundColor: theme.background,
+                                            borderWidth: appTheme.id === theme.id ? 3 : 1,
+                                            borderColor: appTheme.id === theme.id ? theme.primary : '#eee',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            elevation: appTheme.id === theme.id ? 4 : 0
+                                        }}
+                                        onPress={() => {
+                                            setAppTheme(theme);
+                                            saveSettings(appLogo, theme, appAtelierName);
+                                        }}
+                                    >
+                                        <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: theme.primary }} />
+                                        {appTheme.id === theme.id && (
+                                            <View style={{ position: 'absolute', top: -5, right: -5, backgroundColor: theme.primary, borderRadius: 10 }}>
+                                                <CheckCircle2 size={20} color="#fff" />
+                                            </View>
+                                        )}
+                                    </TouchableOpacity>
+                                ))}
+                            </View>
+                        </View>
+
+                        <View style={styles.formCard}>
+                            <Text style={[styles.label, { color: appTheme.primary, textAlign: 'center', fontSize: 13, marginBottom: 15 }]}>SINCRONIZAÇÃO EM NUVEM (GOOGLE SHEETS)</Text>
+                            <View style={{ gap: 10 }}>
+                                <Text style={[styles.label, { color: appTheme.primary }]}>URL DO SCRIPT DO GOOGLE</Text>
+                                <TextInput
+                                    style={styles.input}
+                                    placeholder="https://script.google.com/macros/s/..."
+                                    value={syncUrl}
+                                    onChangeText={(v) => {
+                                        setSyncUrl(v);
+                                        SyncService.setSyncUrl(v);
+                                    }}
+                                />
+                                <TouchableOpacity
+                                    style={[styles.menuBtn, { backgroundColor: appTheme.primary, width: '100%', borderRadius: 50, paddingVertical: 15 }]}
+                                    onPress={async () => {
+                                        if (!syncUrl) {
+                                            Alert.alert('Erro', 'Por favor, insira a URL do script primeiro.');
+                                            return;
+                                        }
+                                        setIsSyncing(true);
+                                        await SyncService.processQueue();
+                                        setIsSyncing(false);
+                                        Alert.alert('Sucesso', 'Sincronização concluída!');
+                                    }}
+                                    disabled={isSyncing}
+                                >
+                                    <RefreshCw color="#fff" size={20} style={{ transform: [{ rotate: isSyncing ? '360deg' : '0deg' }] }} />
+                                    <Text style={[styles.menuBtnText, { fontSize: 16 }]}>{isSyncing ? 'SINCRONIZANDO...' : 'SINCRONIZAR AGORA'}</Text>
+                                </TouchableOpacity>
+
+                                <TouchableOpacity
+                                    style={[styles.menuBtn, { backgroundColor: '#fff', borderWidth: 2, borderColor: appTheme.primary, width: '100%', borderRadius: 50, paddingVertical: 15 }]}
+                                    onPress={handleDownloadFromCloud}
+                                    disabled={isSyncing}
+                                >
+                                    <Download color={appTheme.primary} size={20} />
+                                    <Text style={[styles.menuBtnText, { fontSize: 16, color: appTheme.primary }]}>BAIXAR DADOS</Text>
+                                </TouchableOpacity>
+                            </View>
+                        </View>
+
+                        <View style={styles.formCard}>
+                            <Text style={[styles.label, { color: appTheme.primary, textAlign: 'center', fontSize: 13, marginBottom: 15 }]}>BACKUP E SEGURANÇA</Text>
+                            <View style={{ gap: 15, alignItems: 'center' }}>
+                                <TouchableOpacity
+                                    style={[styles.menuBtn, { backgroundColor: appTheme.primary, width: '100%', borderRadius: 50, paddingVertical: 15 }]}
+                                    onPress={handleExportBackup}
+                                >
+                                    <Download color="#fff" size={20} />
+                                    <Text style={[styles.menuBtnText, { fontSize: 16 }]}>EXPORTAR BACKUP</Text>
+                                </TouchableOpacity>
+
+                                <TouchableOpacity
+                                    style={[styles.menuBtn, { backgroundColor: appTheme.dark, width: '100%', borderRadius: 50, paddingVertical: 15 }]}
+                                    onPress={handleImportBackup}
+                                >
+                                    <Save color="#fff" size={20} />
+                                    <Text style={[styles.menuBtnText, { fontSize: 16 }]}>IMPORTAR BACKUP</Text>
+                                </TouchableOpacity>
+
+                                <TouchableOpacity
+                                    onPress={() => setShowResetDataSection(!showResetDataSection)}
+                                    style={{ padding: 10, marginTop: 5 }}
+                                >
+                                    <ChevronDown size={30} color={appTheme.primary} style={{ transform: [{ rotate: showResetDataSection ? '180deg' : '0deg' }] }} />
+                                </TouchableOpacity>
+
+                                {showResetDataSection && (
+                                    <View style={{ width: '100%', alignItems: 'center', gap: 10 }}>
+                                        <TouchableOpacity
+                                            style={[styles.menuBtn, { backgroundColor: '#ff4d4d', width: '100%', borderRadius: 50, paddingVertical: 15 }]}
+                                            onPress={handleResetData}
+                                        >
+                                            <Trash2 color="#fff" size={20} />
+                                            <Text style={[styles.menuBtnText, { fontSize: 16 }]}>LIMPAR DADOS</Text>
+                                        </TouchableOpacity>
+                                        <Text style={{ fontSize: 11, color: '#666', textAlign: 'center', paddingHorizontal: 10 }}>
+                                            O backup exporta dados de vendas, estoque e todas as fotos dos produtos em um único arquivo.
+                                        </Text>
+                                    </View>
+                                )}
+                            </View>
+                        </View>
+                    </ScrollView>
+                </SafeAreaView>
+                {isDrawerOpen && <TouchableOpacity activeOpacity={1} style={styles.drawerOverlay} onPress={toggleDrawer} />}
+                {renderDrawer()}
+            </ThemeBarWrapper>
+        );
+    }
+
+    return null;
+}
+
+const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: '#fff' },
+    header: { paddingTop: 60, paddingBottom: 40, alignItems: 'center' },
+    title: { fontSize: 28, fontWeight: '900', color: '#1b5e20' },
+    subtitle: { fontSize: 14, color: '#444' },
+    menuContainer: { padding: 20, gap: 10, alignItems: 'center' },
+    menuBtn: { backgroundColor: '#2e7d32', width: '70%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 14, borderRadius: 30, gap: 10, elevation: 4 },
+    menuBtnText: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
+    topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 15, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#eee' },
+    topBarTitle: { fontSize: 18, fontWeight: 'bold', color: '#1b5e20' },
+    scroll: { flex: 1, padding: 15 },
+    itemCard: { backgroundColor: '#fff', borderRadius: 20, padding: 15, marginBottom: 15, elevation: 2 },
+    itemName: { fontSize: 16, fontWeight: 'bold' },
+    itemPrice: { fontSize: 16, color: '#2e7d32', fontWeight: 'bold' },
+    thumbWrapper: { width: 55, height: 55, marginRight: 12, borderRadius: 10, overflow: 'hidden', backgroundColor: '#f0f0f0' },
+    thumb: { width: '100%', height: '100%' },
+    row: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+    actions: { flexDirection: 'row', gap: 15, alignItems: 'center' },
+    fab: { position: 'absolute', bottom: 30, right: 30, backgroundColor: '#2e7d32', width: 60, height: 60, borderRadius: 30, alignItems: 'center', justifyContent: 'center', elevation: 5 },
+    formCard: { backgroundColor: '#fff', borderRadius: 20, padding: 20, marginBottom: 15, elevation: 1 },
+    label: { fontSize: 11, fontWeight: 'bold', color: '#2e7d32', marginBottom: 5 },
+    input: { backgroundColor: '#f8f9fa', padding: 12, borderRadius: 12, borderWidth: 1, borderColor: '#eee', marginBottom: 10 },
+    photoBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 12, borderRadius: 12, borderWidth: 1, borderColor: '#2e7d32', borderStyle: 'dotted' },
+    photoBtnText: { color: '#2e7d32', fontWeight: 'bold', marginLeft: 10 },
+    formImgPrev: { position: 'relative', marginTop: 10 },
+    remImg: { position: 'absolute', top: 5, right: 5, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 15, padding: 4 },
+    saveBtn: { backgroundColor: '#2e7d32', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 18, borderRadius: 18, gap: 10, marginTop: 10 },
+    saveBtnText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+    empty: { marginTop: 100, alignItems: 'center', opacity: 0.5 },
+    closeScan: { position: 'absolute', top: 40, right: 20, zIndex: 10 },
+    scanOverlay: { position: 'absolute', top: '25%', left: '10%', width: '80%', height: '40%', borderStyle: 'dashed', borderWidth: 2, borderColor: '#fff' },
+    scanVez: { width: '100%', height: 1, backgroundColor: '#2e7d32', position: 'absolute', top: '50%' },
+    modalBack: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', alignItems: 'center' },
+    scanResultCard: { backgroundColor: '#fff', width: '85%', borderRadius: 20, padding: 20, alignItems: 'center' },
+    scanResTitle: { fontSize: 12, color: '#999', marginBottom: 10 },
+    resImg: { width: 150, height: 150, borderRadius: 15, marginBottom: 15 },
+    resName: { fontSize: 18, fontWeight: 'bold' },
+    resPrice: { fontSize: 24, fontWeight: 'bold', color: '#2e7d32', marginVertical: 10 },
+    resBtn: { backgroundColor: '#2e7d32', padding: 12, borderRadius: 10, width: '100%', alignItems: 'center' },
+    saleHeader: { flexDirection: 'row', justifyContent: 'space-between', borderBottomWidth: 1, borderColor: '#f0f0f0', paddingBottom: 8, marginBottom: 10 },
+    clientName: { fontWeight: 'bold', color: '#333' },
+    dateText: { fontSize: 11, color: '#999' },
+    instList: { marginTop: 10, backgroundColor: '#fcfcfc', padding: 8, borderRadius: 10 },
+    instRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', borderBottomWidth: 0.5, borderColor: '#eee', paddingVertical: 4 },
+    stBtn: { width: 32, height: 32, borderRadius: 16, justifyContent: 'center', alignItems: 'center' },
+    totalR: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 10 },
+    prodForm: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+    trashBtn: { padding: 10, backgroundColor: '#fdecec', borderRadius: 10, justifyContent: 'center', alignItems: 'center' },
+    addBtn: { backgroundColor: '#2e7d32', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, padding: 15, borderRadius: 15, marginTop: 10, elevation: 2 },
+    addBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+    payToggle: { flexDirection: 'row', backgroundColor: '#f0f0f0', borderRadius: 10, padding: 4, gap: 15 },
+    tBtn: { flex: 1, padding: 10, alignItems: 'center', borderRadius: 8 },
+    tActive: { backgroundColor: '#2e7d32' },
+    pickerB: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#f8f9fa', padding: 12, borderRadius: 10 },
+    pickerO: { backgroundColor: '#fff', elevation: 2, borderRadius: 10, marginTop: 5 },
+    repTabs: { flexDirection: 'row', padding: 10, gap: 10 },
+    repTab: { flex: 1, paddingVertical: 12, paddingHorizontal: 5, backgroundColor: '#fff', borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+    repTabText: { fontSize: 11, fontWeight: 'bold' },
+    catBarWrapper: { backgroundColor: '#fff', elevation: 2, marginBottom: 5 },
+    catHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 10, backgroundColor: '#1b5e20' },
+    catHeaderTitle: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+    catControlBtn: { width: 32, height: 32, backgroundColor: '#2e7d32', borderRadius: 5, justifyContent: 'center', alignItems: 'center' },
+    catScroll: { padding: 10, paddingRight: 30 },
+    catChip: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, backgroundColor: '#f0f0f0', marginRight: 10, borderWidth: 1, borderColor: '#ddd' },
+    catChipActive: { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+    catChipText: { fontWeight: 'bold', color: '#333' },
+    stockControlBtn: {
+        paddingHorizontal: 20,
+        height: 45,
+        borderRadius: 10,
+        justifyContent: 'center',
+        alignItems: 'center',
+        minWidth: 100,
+    },
+    stockControlBtnText: {
+        fontWeight: 'bold',
+        fontSize: 16,
+    },
+    reportBtn: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 12,
+        borderRadius: 12,
+        borderWidth: 1,
+        gap: 10,
+        borderStyle: 'solid',
+    },
+    reportBtnText: {
+        fontWeight: 'bold',
+    },
+    repActive: { backgroundColor: '#2e7d32' },
+    repItem: { backgroundColor: '#fff', padding: 15, borderRadius: 12, marginBottom: 10, flexDirection: 'row', alignItems: 'center', elevation: 1 },
+    repFooter: { padding: 20, backgroundColor: '#fff', flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center' },
+    previewContainer: { flex: 1, backgroundColor: 'rgba(0,0,0,0.9)', justifyContent: 'center', alignItems: 'center' },
+    previewImage: { width: '90%', height: '80%', borderRadius: 15 },
+    previewClose: { position: 'absolute', top: 50, right: 30, backgroundColor: 'rgba(255,255,255,0.2)', width: 50, height: 50, borderRadius: 25, justifyContent: 'center', alignItems: 'center', zIndex: 10 },
+    previewShare: {
+        position: 'absolute',
+        bottom: 50,
+        backgroundColor: 'rgba(255,255,255,0.2)',
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 30,
+        paddingVertical: 15,
+        borderRadius: 50,
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.3)',
+    },
+    searchBar: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#fff',
+        marginHorizontal: 15,
+        marginVertical: 10,
+        borderRadius: 10,
+        elevation: 2,
+        height: 45,
+    },
+    searchInput: {
+        flex: 1,
+        paddingHorizontal: 10,
+        fontSize: 16,
+    },
+    // Autocomplete Suggestions
+    suggestionsContainer: {
+        backgroundColor: '#fff',
+        borderRadius: 10,
+        borderWidth: 1,
+        borderColor: '#eee',
+        marginTop: -5,
+        marginBottom: 10,
+        elevation: 3,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
+        overflow: 'hidden'
+    },
+    suggestionItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 12,
+        borderBottomWidth: 1,
+        borderBottomColor: '#f9f9f9',
+        gap: 10
+    },
+    suggestionText: {
+        fontSize: 14,
+        color: '#333',
+        fontWeight: '500'
+    },
+    // Drawer Styles
+    drawer: {
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+        left: 0,
+        width: 280,
+        backgroundColor: '#fff',
+        zIndex: 1000,
+        elevation: 10,
+        shadowColor: '#000',
+        shadowOffset: { width: 4, height: 0 },
+        shadowOpacity: 0.3,
+        shadowRadius: 5,
+    },
+    drawerOverlay: {
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+        left: 0,
+        right: 0,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        zIndex: 999,
+    },
+    drawerHeader: {
+        padding: 30,
+        alignItems: 'center',
+        borderBottomWidth: 1,
+        borderBottomColor: 'rgba(255,255,255,0.2)',
+    },
+    drawerLogoWrapper: {
+        width: 100,
+        height: 100,
+        borderRadius: 50,
+        backgroundColor: '#fff',
+        overflow: 'hidden',
+        marginBottom: 10,
+    },
+    drawerTitle: {
+        color: '#fff',
+        fontSize: 18,
+        fontWeight: 'bold',
+    },
+    drawerContent: {
+        flex: 1,
+        padding: 15,
+    },
+    drawerItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 15,
+        borderRadius: 10,
+        marginBottom: 5,
+    },
+    drawerItemText: {
+        color: '#fff',
+        fontSize: 16,
+        marginLeft: 15,
+        fontWeight: '500',
+    },
+});
