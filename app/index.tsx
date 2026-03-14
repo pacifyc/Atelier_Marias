@@ -16,6 +16,7 @@ import {
     Download,
     Edit2,
     FileText,
+    Image as ImageIcon,
     LogOut,
     Menu,
     Package,
@@ -150,7 +151,7 @@ const InventoryItem = memo(({ item, onPreview, onEdit, onDelete, onAddToQueue, i
             <View style={{ flex: 1 }}>
                 <Text style={styles.itemName}>{item.name}</Text>
                 <View style={styles.row}>
-                    <Text style={styles.itemPrice}>R$ {item.price.replace('.', ',')}</Text>
+                    <Text style={styles.itemPrice}>R$ {parseFloat(item.price || '0').toFixed(2).replace('.', ',')}</Text>
                 </View>
             </View>
             <View style={styles.actions}>
@@ -207,14 +208,14 @@ const SaleItem = memo(({ item, onEdit, onDelete, onToggleStatus, theme, getStatu
     </View>
 ));
 
-const ReportRecord = memo(({ item, theme }: any) => (
-    <View style={styles.repItem}>
+const ReportRecord = memo(({ item, theme, onPress }: any) => (
+    <TouchableOpacity style={styles.repItem} onPress={onPress}>
         <View style={{ flex: 1 }}>
             <Text style={{ fontWeight: 'bold' }}>{item.client}</Text>
             <Text style={{ fontSize: 12 }}>{item.installment.number}ª Parc. - {item.installment.date.split('-').reverse().join('/')}</Text>
         </View>
         <Text style={{ fontWeight: 'bold', color: theme.primary }}>R$ {item.installment.value.toFixed(2).replace('.', ',')}</Text>
-    </View>
+    </TouchableOpacity>
 ));
 
 export default function App() {
@@ -237,17 +238,26 @@ export default function App() {
     const [showCategoryModal, setShowCategoryModal] = useState(false);
 
     // Fila de Impressão
-    const [printQueue, setPrintQueue] = useState<ItemEstoque[]>([]);
+    const [printQueue, setPrintQueue] = useState<{ item: ItemEstoque; qty: number }[]>([]);
     const [showPrintQueueModal, setShowPrintQueueModal] = useState(false);
     const [batchQrIncludePrice, setBatchQrIncludePrice] = useState(false);
     const [batchQrIncludeName, setBatchQrIncludeName] = useState(false);
 
-    const togglePrintQueue = (item: ItemEstoque) => {
-        const index = printQueue.findIndex(q => q.id === item.id);
-        if (index >= 0) {
-            setPrintQueue(printQueue.filter(q => q.id !== item.id));
+    // Modal de Quantidade de QR
+    const [showQtyModal, setShowQtyModal] = useState(false);
+    const [qtyModalItem, setQtyModalItem] = useState<ItemEstoque | null>(null);
+    const [qtyModalValue, setQtyModalValue] = useState(1);
+
+    const openQtyModal = (item: ItemEstoque) => {
+        const exists = printQueue.find(q => q.item.id === item.id);
+        if (exists) {
+            // Já está na fila: remove direto
+            setPrintQueue(prev => prev.filter(q => q.item.id !== item.id));
         } else {
-            setPrintQueue([...printQueue, item]);
+            // Abre popup de quantidade
+            setQtyModalItem(item);
+            setQtyModalValue(1);
+            setShowQtyModal(true);
         }
     };
 
@@ -344,6 +354,7 @@ export default function App() {
     const [prodCategory, setProdCategory] = useState('Geral');
     const [prodStock, setProdStock] = useState(0);
     const [prodHistory, setProdHistory] = useState<Array<{ date: string; type: 'input' | 'output' | 'sale'; quantity: number }>>([]);
+    const [showProductReportModal, setShowProductReportModal] = useState(false);
 
     // Estado do Modal de Ajuste de Estoque
     const [showStockModal, setShowStockModal] = useState(false);
@@ -355,6 +366,12 @@ export default function App() {
     const [showQrOptionsModal, setShowQrOptionsModal] = useState(false);
     const [qrIncludePrice, setQrIncludePrice] = useState(true);
     const [qrProductForModal, setQrProductForModal] = useState<ItemEstoque | null>(null);
+
+    // Estado do Modal de Edição de Parcelas
+    const [showInstallmentEditModal, setShowInstallmentEditModal] = useState(false);
+    const [editingInstIdx, setEditingInstIdx] = useState<number | null>(null);
+    const [tempInstValue, setTempInstValue] = useState('');
+    const [tempInstDate, setTempInstDate] = useState('');
 
     const handlePickLogo = async () => {
         const result = await ImagePicker.launchImageLibraryAsync({
@@ -587,63 +604,95 @@ export default function App() {
         setProducts(newProducts);
     };
 
-    const handleSaveSale = () => {
-        if (!client || products.some(p => !p.name || !p.price || isNaN(parseFloat(p.price)) || !p.quantity || isNaN(parseInt(p.quantity)))) {
-            Alert.alert('Atenção', 'Preencha todos os campos corretamente.');
+    const handleSaveSale = async () => {
+        if (!client || products.length === 0 || products.some(p => !p.name || !p.price || isNaN(parseFloat(p.price)) || !p.quantity || isNaN(parseInt(p.quantity)))) {
+            Alert.alert('Atenção', 'Preencha todos os campos corretamente (mínimo de 1 produto).');
             return;
         }
         const totalValue = products.reduce((acc, p) => acc + (parseFloat(p.price || '0') * (parseInt(p.quantity || '1') || 1)), 0);
+
+        // --- Verificação de estoque antes de salvar ---
+        const newInventory = [...inventory];
+
+        // Se for EDIÇÃO, primeiro "devolvemos" o estoque da venda anterior para recalcular
+        if (editingSale) {
+            for (const oldP of editingSale.products) {
+                const oldQty = parseInt(oldP.quantity) || 1;
+                let oldIdx = -1;
+                if (oldP.inventoryId) {
+                    oldIdx = newInventory.findIndex(item => item.id === oldP.inventoryId);
+                } else if (oldP.name) {
+                    oldIdx = newInventory.findIndex(item => item.name.toLowerCase() === oldP.name.toLowerCase());
+                }
+
+                if (oldIdx !== -1) {
+                    newInventory[oldIdx].stock += oldQty;
+                    // Removemos a última entrada de 'sale' se possível ou apenas deixamos o rastro?
+                    // Para manter simples e honesto, adicionamos uma entrada de 'ajuste/correção' ou apenas devolvemos
+                    newInventory[oldIdx].history = [{
+                        date: new Date().toISOString(),
+                        type: 'input' as const,
+                        quantity: oldQty
+                    }, ...(newInventory[oldIdx].history || [])];
+                }
+            }
+        }
+
+        // 1. Mapear produtos para garantir que tenham inventoryId (mesmo se digitados manualmente)
+        const finalProducts = products.map(p => {
+            if (p.inventoryId) return p;
+            const found = newInventory.find(item => item.name.toLowerCase() === p.name.toLowerCase());
+            return found ? { ...p, inventoryId: found.id } : p;
+        });
+
+        const inventoryToUpdate: ItemEstoque[] = [];
+
+        for (const p of finalProducts) {
+            const qty = parseInt(p.quantity) || 1;
+            // Tenta achar pelo ID ou pelo nome
+            let itemIdx = -1;
+            if (p.inventoryId) {
+                itemIdx = newInventory.findIndex(item => item.id === p.inventoryId);
+            } else if (p.name) {
+                itemIdx = newInventory.findIndex(item => item.name.toLowerCase() === p.name.toLowerCase());
+            }
+
+            if (itemIdx !== -1) {
+                if (newInventory[itemIdx].stock < qty) {
+                    Alert.alert('Estoque Insuficiente', `O produto "${newInventory[itemIdx].name}" tem apenas ${newInventory[itemIdx].stock} em estoque.`);
+                    return;
+                }
+                // Prepara a atualização
+                newInventory[itemIdx].stock -= qty;
+                newInventory[itemIdx].history = [{
+                    date: new Date().toISOString(),
+                    type: 'sale' as const,
+                    quantity: qty
+                }, ...(newInventory[itemIdx].history || [])];
+                inventoryToUpdate.push(newInventory[itemIdx]);
+            }
+        }
+
         const saleData: Venda = {
             id: editingSale?.id || Date.now().toString(),
-            client, date, products, paymentType,
+            client,
+            date,
+            products: finalProducts,
+            paymentType,
             installments: paymentType === 'parcelado' ? installments : '1',
             installmentList,
             totalValue
         };
+
         const updated = editingSale ? sales.map(s => s.id === editingSale.id ? saleData : s) : [saleData, ...sales];
         setSales(updated);
-        DatabaseService.saveSale(saleData);
+        await DatabaseService.saveSale(saleData);
 
-        // Baixa automática de estoque
-        if (products.length > 0) {
-            const newInventory = [...inventory];
-            let inventoryChanged = false;
-
-            products.forEach(p => {
-                if (p.inventoryId) {
-                    const itemIdx = newInventory.findIndex(item => item.id === p.inventoryId);
-                    if (itemIdx !== -1) {
-                        const qty = parseInt(p.quantity) || 1;
-                        newInventory[itemIdx].stock -= qty;
-
-                        // Adicionar ao histórico
-                        const historyEntry = {
-                            date: new Date().toISOString(), // Timestamp completo
-                            type: 'sale' as const,
-                            quantity: qty
-                        };
-                        newInventory[itemIdx].history = [historyEntry, ...(newInventory[itemIdx].history || [])];
-                        inventoryChanged = true;
-                    }
-                }
-            });
-
-            if (inventoryChanged) {
-                setInventory(newInventory);
-                // Atualizar produtos modificados no banco
-                newInventory.forEach(async (item) => {
-                    // Otimização: Poderíamos filtrar apenas os mudados, mas aqui iteramos
-                    // Na verdade, só precisamos salvar os itens que foram vendidos.
-                    // Mas a lógica anterior `inventoryChanged` não dizia QUAIS mudaram.
-                    // Vamos salvar APENAS os envolvidos na venda para ser eficiente.
-                });
-                // Correção: salvar apenas os itens alterados
-                products.forEach(async p => {
-                    if (p.inventoryId) {
-                        const item = newInventory.find(i => i.id === p.inventoryId);
-                        if (item) await DatabaseService.saveProduct(item);
-                    }
-                });
+        // --- Persistir mudanças no estoque ---
+        if (inventoryToUpdate.length > 0) {
+            setInventory(newInventory);
+            for (const item of inventoryToUpdate) {
+                await DatabaseService.saveProduct(item);
             }
         }
 
@@ -654,7 +703,41 @@ export default function App() {
         Alert.alert("Excluir Venda", "Tem certeza?", [
             { text: "Cancelar" },
             {
-                text: "Excluir", style: "destructive", onPress: () => {
+                text: "Excluir", style: "destructive", onPress: async () => {
+                    const saleToDelete = sales.find(s => s.id === id);
+                    if (saleToDelete) {
+                        // Estorno de estoque: Devolver itens ao inventário
+                        const newInventory = [...inventory];
+                        const inventoryToUpdate: ItemEstoque[] = [];
+
+                        for (const p of saleToDelete.products) {
+                            const qty = parseInt(p.quantity) || 1;
+                            let itemIdx = -1;
+                            if (p.inventoryId) {
+                                itemIdx = newInventory.findIndex(item => item.id === p.inventoryId);
+                            } else if (p.name) {
+                                itemIdx = newInventory.findIndex(item => item.name.toLowerCase() === p.name.toLowerCase());
+                            }
+
+                            if (itemIdx !== -1) {
+                                newInventory[itemIdx].stock += qty;
+                                newInventory[itemIdx].history = [{
+                                    date: new Date().toISOString(),
+                                    type: 'input' as const, // Entrada por estorno/cancelamento
+                                    quantity: qty
+                                }, ...(newInventory[itemIdx].history || [])];
+                                inventoryToUpdate.push(newInventory[itemIdx]);
+                            }
+                        }
+
+                        if (inventoryToUpdate.length > 0) {
+                            setInventory(newInventory);
+                            for (const item of inventoryToUpdate) {
+                                await DatabaseService.saveProduct(item);
+                            }
+                        }
+                    }
+
                     const updated = sales.filter(s => s.id !== id);
                     setSales(updated);
                     DatabaseService.deleteSale(id);
@@ -686,6 +769,22 @@ export default function App() {
         setView('qr_form');
     };
 
+    const openInstallmentEditModal = (idx: number) => {
+        setEditingInstIdx(idx);
+        setTempInstValue(installmentList[idx].value.toFixed(2).replace('.', ','));
+        setTempInstDate(installmentList[idx].date);
+        setShowInstallmentEditModal(true);
+    };
+
+    const confirmInstallmentEdit = () => {
+        if (editingInstIdx !== null) {
+            handleUpdateInstallment(editingInstIdx, 'date', tempInstDate);
+            handleUpdateInstallment(editingInstIdx, 'value', tempInstValue);
+            setEditingInstIdx(null);
+            setShowInstallmentEditModal(false);
+        }
+    };
+
     const handleStockAdjustment = () => {
         const qty = parseInt(stockAdjustment);
         if (isNaN(qty) || qty <= 0) {
@@ -694,6 +793,10 @@ export default function App() {
         }
 
         const type = stockModalType;
+        if (type === 'output' && qty > prodStock) {
+            Alert.alert('Erro', 'Saldo insuficiente em estoque.');
+            return;
+        }
         const newStockCount = type === 'input' ? prodStock + qty : prodStock - qty;
 
         const historyEntry = {
@@ -804,8 +907,31 @@ export default function App() {
         }
 
         const result = await ImagePicker.launchCameraAsync({
-            quality: 0.7,
+            quality: 0.5,
             allowsEditing: false
+        });
+
+        if (!result.canceled) {
+            const uri = result.assets ? result.assets[0].uri : (result as any).uri;
+            if (uri) {
+                setProdImage(uri);
+            } else {
+                Alert.alert('Erro', 'Não foi possível obter o caminho da imagem.');
+            }
+        }
+    };
+
+    const handlePickFromGallery = async () => {
+        const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (status !== 'granted') {
+            Alert.alert('Erro', 'Precisamos da permissão da galeria para selecionar uma foto.');
+            return;
+        }
+
+        const result = await ImagePicker.launchImageLibraryAsync({
+            mediaTypes: ['images'],
+            allowsEditing: false,
+            quality: 0.5,
         });
 
         if (!result.canceled) {
@@ -960,9 +1086,10 @@ export default function App() {
         </head>
         <body>
           <div class="grid">
-            ${printQueue.map(prod => {
-            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${prod.id}`;
-            return `
+            ${printQueue.flatMap(({ item: prod, qty }) =>
+            Array.from({ length: qty }).map(() => {
+                const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${prod.id}`;
+                return `
               <div class="label-container">
                 <div class="atelier-name">${appAtelierName || 'ATELIÊ'}</div>
                 ${batchQrIncludeName ? `<div class="product-name">${prod.name}</div>` : ''}
@@ -970,7 +1097,7 @@ export default function App() {
                 <img src="${qrUrl}" class="qr-code" />
                 ${!noRef ? `<div class="ref-id">Ref: ${prod.id}</div>` : ''}
               </div>
-            `}).join('')}
+            `})).join('')}
           </div>
         </body>
       </html>
@@ -1293,11 +1420,12 @@ export default function App() {
 
             if (result.canceled) return;
 
-            const fileContent = await readAsStringAsync(result.assets[0].uri);
+            const fileContent = await readAsStringAsync(result.assets[0].uri, { encoding: EncodingType.UTF8 });
             const backup = JSON.parse(fileContent);
 
-            if (!backup.v || (!backup.sales && !backup.inventory)) {
-                throw new Error('Formato de backup inválido.');
+            if (!backup.sales && !backup.inventory && !backup.categories) {
+                Alert.alert('Erro', 'O arquivo selecionado não contém dados válidos de backup.');
+                return;
             }
 
             Alert.alert("Restaurar Backup", "Isso irá substituir todos os dados atuais. Continuar?", [
@@ -1608,8 +1736,8 @@ export default function App() {
                                     }
                                 }}
                                 onDelete={handleDeleteProduct}
-                                onAddToQueue={togglePrintQueue}
-                                isInQueue={printQueue.some(q => q.id === item.id)}
+                                onAddToQueue={openQtyModal}
+                                isInQueue={printQueue.some(q => q.item.id === item.id)}
                             />
                         )}
                     />
@@ -1700,6 +1828,59 @@ export default function App() {
                         </View>
                     </Modal>
 
+                    {/* Modal Quantidade de QR */}
+                    <Modal visible={showQtyModal} transparent animationType="fade">
+                        <View style={styles.modalBack}>
+                            <View style={[styles.scanResultCard, { width: '85%' }]}>
+                                <Text style={styles.scanResTitle}>ADICIONAR À FILA</Text>
+                                <Text style={{ fontWeight: 'bold', fontSize: 16, marginTop: 5 }}>{qtyModalItem?.name}</Text>
+                                <Text style={{ fontSize: 13, color: '#666', marginBottom: 18 }}>
+                                    R$ {parseFloat(qtyModalItem?.price || '0').toFixed(2).replace('.', ',')}
+                                </Text>
+
+                                {/* Controle de quantidade */}
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 20, marginBottom: 24, backgroundColor: '#f5f5f5', borderRadius: 12, paddingVertical: 10, paddingHorizontal: 20 }}>
+                                    <TouchableOpacity
+                                        onPress={() => setQtyModalValue(v => Math.max(1, v - 1))}
+                                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#ddd', justifyContent: 'center', alignItems: 'center' }}
+                                    >
+                                        <Text style={{ fontSize: 24, fontWeight: 'bold', color: '#333', lineHeight: 28 }}>−</Text>
+                                    </TouchableOpacity>
+                                    <View style={{ alignItems: 'center' }}>
+                                        <Text style={{ fontSize: 13, color: '#888' }}>QR</Text>
+                                        <Text style={{ fontSize: 28, fontWeight: 'bold', color: appTheme.dark, minWidth: 40, textAlign: 'center' }}>{qtyModalValue}</Text>
+                                    </View>
+                                    <TouchableOpacity
+                                        onPress={() => setQtyModalValue(v => v + 1)}
+                                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: appTheme.primary, justifyContent: 'center', alignItems: 'center' }}
+                                    >
+                                        <Text style={{ fontSize: 24, fontWeight: 'bold', color: '#fff', lineHeight: 28 }}>+</Text>
+                                    </TouchableOpacity>
+                                </View>
+
+                                <View style={{ flexDirection: 'row', gap: 10, width: '100%' }}>
+                                    <TouchableOpacity
+                                        style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]}
+                                        onPress={() => setShowQtyModal(false)}
+                                    >
+                                        <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        style={[styles.resBtn, { backgroundColor: appTheme.primary, flex: 1 }]}
+                                        onPress={() => {
+                                            if (qtyModalItem) {
+                                                setPrintQueue(prev => [...prev, { item: qtyModalItem, qty: qtyModalValue }]);
+                                            }
+                                            setShowQtyModal(false);
+                                        }}
+                                    >
+                                        <Text style={{ fontWeight: 'bold', color: '#fff' }}>ADICIONAR</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            </View>
+                        </View>
+                    </Modal>
+
                     {/* Modal Fila de Impressão */}
                     <Modal visible={showPrintQueueModal} transparent animationType="slide">
                         <View style={styles.modalBack}>
@@ -1739,13 +1920,31 @@ export default function App() {
                                 ) : (
                                     <>
                                         <ScrollView style={{ width: '100%', marginBottom: 15 }}>
-                                            {printQueue.map(item => (
-                                                <View key={item.id} style={[styles.row, { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eee' }]}>
+                                            {printQueue.map(({ item, qty }) => (
+                                                <View key={item.id} style={[styles.row, { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eee', alignItems: 'center' }]}>
                                                     <View style={{ flex: 1 }}>
                                                         <Text style={{ fontWeight: 'bold' }}>{item.name}</Text>
-                                                        <Text style={{ fontSize: 12, color: '#666' }}>R$ {item.price.replace('.', ',')}</Text>
+                                                        <Text style={{ fontSize: 12, color: '#666' }}>R$ {parseFloat(item.price || '0').toFixed(2).replace('.', ',')}</Text>
                                                     </View>
-                                                    <TouchableOpacity onPress={() => togglePrintQueue(item)}>
+                                                    {/* Controle ± de quantidade inline */}
+                                                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginRight: 10 }}>
+                                                        <TouchableOpacity
+                                                            onPress={() => setPrintQueue(prev => prev.map(q => q.item.id === item.id ? { ...q, qty: Math.max(1, q.qty - 1) } : q))}
+                                                            style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: '#ddd', justifyContent: 'center', alignItems: 'center' }}
+                                                        >
+                                                            <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#333', lineHeight: 22 }}>−</Text>
+                                                        </TouchableOpacity>
+                                                        <Text style={{ fontSize: 14, fontWeight: 'bold', color: appTheme.dark, minWidth: 28, textAlign: 'center' }}>
+                                                            QR={qty}
+                                                        </Text>
+                                                        <TouchableOpacity
+                                                            onPress={() => setPrintQueue(prev => prev.map(q => q.item.id === item.id ? { ...q, qty: q.qty + 1 } : q))}
+                                                            style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: appTheme.primary, justifyContent: 'center', alignItems: 'center' }}
+                                                        >
+                                                            <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#fff', lineHeight: 22 }}>+</Text>
+                                                        </TouchableOpacity>
+                                                    </View>
+                                                    <TouchableOpacity onPress={() => setPrintQueue(prev => prev.filter(q => q.item.id !== item.id))}>
                                                         <Trash2 size={20} color="#ff4d4d" />
                                                     </TouchableOpacity>
                                                 </View>
@@ -1763,6 +1962,7 @@ export default function App() {
                                                 style={[styles.resBtn, { backgroundColor: appTheme.primary, flex: 2 }]}
                                                 onPress={() => {
                                                     generateBatchPDF();
+                                                    setPrintQueue([]);
                                                     setShowPrintQueueModal(false);
                                                 }}
                                             >
@@ -1845,7 +2045,7 @@ export default function App() {
                             <TouchableOpacity onPress={() => setView('categories_list')}><ChevronLeft color={appTheme.primary} size={32} /></TouchableOpacity>
                             <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>PRODUTO</Text><View style={{ width: 32 }} />
                         </View>
-                        <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
+                        <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 80 }}>
                             <View style={styles.formCard}>
                                 <Text style={[styles.label, { color: appTheme.primary }]}>NOME DO PRODUTO</Text>
                                 <TextInput style={styles.input} placeholder="Ex: Vestido Floral" value={prodName} onChangeText={setProdName} />
@@ -1886,14 +2086,23 @@ export default function App() {
 
                                 <TouchableOpacity
                                     style={[styles.reportBtn, { borderColor: appTheme.primary }]}
-                                    onPress={() => generateProductHistoryPDF(editingProduct!)}
+                                    onPress={() => setShowProductReportModal(true)}
                                     disabled={!editingProduct}
                                 >
                                     <FileText size={20} color={appTheme.primary} />
                                     <Text style={[styles.reportBtnText, { color: appTheme.primary }]}>RELATÓRIO</Text>
                                 </TouchableOpacity>
 
-                                <TouchableOpacity style={[styles.photoBtn, { borderColor: appTheme.primary, marginTop: 15 }]} onPress={handlePickImage}><Camera size={24} color={appTheme.primary} /><Text style={[styles.photoBtnText, { color: appTheme.primary }]}>{prodImage ? 'TROCAR FOTO' : 'TIRAR FOTO DO PRODUTO'}</Text></TouchableOpacity>
+                                <View style={{ flexDirection: 'row', gap: 10, marginTop: 15 }}>
+                                    <TouchableOpacity style={[styles.photoBtn, { borderColor: appTheme.primary, flex: 1 }]} onPress={handlePickFromGallery}>
+                                        <ImageIcon size={24} color={appTheme.primary} />
+                                        <Text style={[styles.photoBtnText, { color: appTheme.primary }]}>GALERIA</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity style={[styles.photoBtn, { borderColor: appTheme.primary, flex: 1 }]} onPress={handlePickImage}>
+                                        <Camera size={24} color={appTheme.primary} />
+                                        <Text style={[styles.photoBtnText, { color: appTheme.primary }]}>FOTO</Text>
+                                    </TouchableOpacity>
+                                </View>
                                 {prodImage && (
                                     <View style={styles.formImgPrev}>
                                         <Text style={{ color: appTheme.primary, fontWeight: 'bold', fontSize: 10, textAlign: 'center', marginBottom: 5 }}>FOTO CAPTURADA! ✅</Text>
@@ -1924,6 +2133,60 @@ export default function App() {
                                         </TouchableOpacity>
                                         <TouchableOpacity style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary }]} onPress={handleStockAdjustment}>
                                             <Text style={{ fontWeight: 'bold', color: '#fff' }}>CONFIRMAR</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            </View>
+                        </Modal>
+
+                        {/* Modal de Relatório de Produto */}
+                        <Modal visible={showProductReportModal} transparent animationType="slide">
+                            <View style={styles.modalBack}>
+                                <View style={[styles.scanResultCard, { maxHeight: '80%', width: '90%' }]}>
+                                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', marginBottom: 15 }}>
+                                        <Text style={styles.scanResTitle}>HISTÓRICO DE ESTOQUE</Text>
+                                        <TouchableOpacity onPress={() => setShowProductReportModal(false)}>
+                                            <X size={24} color="#666" />
+                                        </TouchableOpacity>
+                                    </View>
+
+                                    <ScrollView style={{ width: '100%', marginBottom: 15 }}>
+                                        {prodHistory.length === 0 ? (
+                                            <Text style={{ textAlign: 'center', color: '#666', marginTop: 20 }}>Nenhum histórico encontrado.</Text>
+                                        ) : (
+                                            prodHistory.map((h, i) => {
+                                                const d = h.date.includes('T') ? new Date(h.date) : null;
+                                                const dateStr = d ? d.toLocaleDateString('pt-BR') : h.date.split('-').reverse().join('/');
+                                                const typeLabels: any = { input: 'ENTRADA', output: 'SAÍDA', sale: 'VENDA' };
+                                                const typeColors: any = { input: '#2e7d32', output: '#f57c00', sale: '#1565c0' };
+                                                return (
+                                                    <View key={i} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eee' }}>
+                                                        <View>
+                                                            <Text style={{ fontWeight: 'bold' }}>{dateStr}</Text>
+                                                            <Text style={{ color: typeColors[h.type] || '#666', fontSize: 12, fontWeight: 'bold' }}>{typeLabels[h.type] || h.type}</Text>
+                                                        </View>
+                                                        <Text style={{ fontSize: 16, fontWeight: 'bold' }}>{h.quantity}</Text>
+                                                    </View>
+                                                );
+                                            })
+                                        )}
+                                    </ScrollView>
+
+                                    <View style={{ flexDirection: 'row', gap: 10, width: '100%' }}>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]}
+                                            onPress={() => setShowProductReportModal(false)}
+                                        >
+                                            <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary }]}
+                                            onPress={() => {
+                                                setShowProductReportModal(false);
+                                                generateProductHistoryPDF(editingProduct!);
+                                            }}
+                                        >
+                                            <Text style={{ fontWeight: 'bold', color: '#fff' }}>GERAR PDF</Text>
                                         </TouchableOpacity>
                                     </View>
                                 </View>
@@ -2092,21 +2355,19 @@ export default function App() {
                                                         <View style={{ backgroundColor: appTheme.primary, width: 24, height: 24, borderRadius: 12, justifyContent: 'center', alignItems: 'center' }}>
                                                             <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{inst.number}º</Text>
                                                         </View>
-                                                        <TextInput
-                                                            style={[styles.input, { flex: 2, marginBottom: 0, fontSize: 12, backgroundColor: '#fff' }]}
-                                                            value={inst.date}
-                                                            onChangeText={(v) => handleUpdateInstallment(idx, 'date', v)}
-                                                            placeholder="YYYY-MM-DD"
-                                                        />
-                                                        <View style={[styles.input, { flex: 1.5, marginBottom: 0, flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', paddingHorizontal: 5 }]}>
-                                                            <Text style={{ fontSize: 10, color: '#666' }}>R$</Text>
-                                                            <TextInput
-                                                                style={{ flex: 1, fontSize: 12, paddingLeft: 5 }}
-                                                                value={inst.value.toFixed(2).replace('.', ',')}
-                                                                onChangeText={(v) => handleUpdateInstallment(idx, 'value', v)}
-                                                                keyboardType="numeric"
-                                                            />
-                                                        </View>
+                                                        <TouchableOpacity
+                                                            style={[styles.input, { flex: 2, marginBottom: 0, justifyContent: 'center', backgroundColor: '#fff' }]}
+                                                            onPress={() => openInstallmentEditModal(idx)}
+                                                        >
+                                                            <Text style={{ fontSize: 12, color: '#333' }}>{inst.date}</Text>
+                                                        </TouchableOpacity>
+                                                        <TouchableOpacity
+                                                            style={[styles.input, { flex: 1.5, marginBottom: 0, flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', paddingHorizontal: 5 }]}
+                                                            onPress={() => openInstallmentEditModal(idx)}
+                                                        >
+                                                            <Text style={{ fontSize: 10, color: '#666' }}>R$ </Text>
+                                                            <Text style={{ fontSize: 12, color: '#333' }}>{inst.value.toFixed(2).replace('.', ',')}</Text>
+                                                        </TouchableOpacity>
                                                     </View>
                                                 ))}
                                             </View>
@@ -2117,6 +2378,51 @@ export default function App() {
                             <TouchableOpacity style={[styles.saveBtn, { backgroundColor: appTheme.primary }]} onPress={handleSaveSale}><Save size={24} color="#fff" /><Text style={styles.saveBtnText}>SALVAR</Text></TouchableOpacity>
                         </ScrollView>
                     </KeyboardAvoidingView>
+                    {showInstallmentEditModal && (
+                        <Modal visible={showInstallmentEditModal} transparent animationType="fade">
+                            <View style={styles.modalBack}>
+                                <View style={styles.scanResultCard}>
+                                    <View style={{ backgroundColor: appTheme.primary, width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center', marginBottom: 15 }}>
+                                        <Text style={{ color: '#fff', fontSize: 16, fontWeight: 'bold' }}>{editingInstIdx !== null ? editingInstIdx + 1 : ''}º</Text>
+                                    </View>
+                                    <Text style={styles.scanResTitle}>EDITAR PARCELA</Text>
+
+                                    <View style={{ width: '100%', marginBottom: 15 }}>
+                                        <Text style={[styles.label, { color: appTheme.primary }]}>DATA (AAAA-MM-DD)</Text>
+                                        <TextInput
+                                            style={[styles.input, { marginBottom: 10 }]}
+                                            value={tempInstDate}
+                                            onChangeText={setTempInstDate}
+                                            placeholder="2024-01-01"
+                                        />
+
+                                        <Text style={[styles.label, { color: appTheme.primary }]}>VALOR (R$)</Text>
+                                        <TextInput
+                                            style={styles.input}
+                                            value={tempInstValue}
+                                            onChangeText={setTempInstValue}
+                                            placeholder="0,00"
+                                        />
+                                    </View>
+
+                                    <View style={{ flexDirection: 'row', gap: 10, width: '100%' }}>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]}
+                                            onPress={() => { setShowInstallmentEditModal(false); setEditingInstIdx(null); }}
+                                        >
+                                            <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary }]}
+                                            onPress={confirmInstallmentEdit}
+                                        >
+                                            <Text style={{ fontWeight: 'bold', color: '#fff' }}>CONFIRMAR</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            </View>
+                        </Modal>
+                    )}
                     {scanning && (
                         <Modal animationType="slide" transparent={false} visible={scanning}>
                             <View style={{ flex: 1, backgroundColor: '#000' }}>
@@ -2171,7 +2477,15 @@ export default function App() {
                         ListEmptyComponent={<View style={styles.empty}><FileText size={48} color="#ccc" /><Text>Nada aqui.</Text></View>}
                         ListFooterComponent={<View style={{ height: 100 }} />}
                         renderItem={({ item }) => (
-                            <ReportRecord item={item} theme={appTheme} />
+                            <ReportRecord
+                                item={item}
+                                theme={appTheme}
+                                onPress={() => {
+                                    setSaleSearchQuery(item.client);
+                                    setIsSaleSearching(true);
+                                    setView('list');
+                                }}
+                            />
                         )}
                     />
                     <View style={styles.repFooter}><Text>TOTAL: </Text><Text style={{ fontSize: 22, fontWeight: 'bold', color: appTheme.primary }}>R$ {tot.toFixed(2).replace('.', ',')}</Text></View>
