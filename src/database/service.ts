@@ -70,6 +70,15 @@ export const DatabaseService = {
         const database = await initDatabase();
         try {
             await database.runAsync('DELETE FROM categories WHERE name = ?', name);
+
+            // Sync deletion to Cloud
+            SyncService.addToQueue({
+                id: name,
+                action: 'delete_category',
+                payload: name,
+                timestamp: Date.now()
+            });
+
             return true;
         } catch (e) {
             console.error('Error deleting category:', e);
@@ -99,7 +108,7 @@ export const DatabaseService = {
             inventory.push({
                 id: p.id,
                 name: p.name || 'Produto sem nome',
-                price: (p.price || 0).toString(),
+                price: p.price ? parseFloat(p.price).toFixed(2) : '0.00',
                 image: p.image,
                 category: p.category_name || 'Geral',
                 stock: p.stock || 0,
@@ -128,7 +137,12 @@ export const DatabaseService = {
             }
 
             // 2. Insert or Replace Product
-            const safePrice = isNaN(parseFloat(product.price)) ? 0 : parseFloat(product.price);
+            let sanitizedPrice = product.price.toString().replace('R$', '').trim();
+            // Just replace , with . for safe JS parsing. Do not remove dots which are already decimal separators.
+            sanitizedPrice = sanitizedPrice.replace(/,/g, '.');
+            const safePrice = isNaN(parseFloat(sanitizedPrice)) ? 0 : parseFloat(sanitizedPrice);
+
+
             await database.runAsync(`
             INSERT OR REPLACE INTO products (id, name, price, image, category_id, stock)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -173,6 +187,15 @@ export const DatabaseService = {
         const database = await initDatabase();
         try {
             await database.runAsync('DELETE FROM products WHERE id = ?', id);
+
+            // Sync deletion to Cloud
+            SyncService.addToQueue({
+                id: id,
+                action: 'delete_product',
+                payload: id,
+                timestamp: Date.now()
+            });
+
             return true;
         } catch (e) {
             console.error(e);
@@ -201,7 +224,7 @@ export const DatabaseService = {
                 products: items.map(i => ({
                     id: (i.id || '').toString(), // Temp id for UI map keys
                     name: i.product_name || 'Produto sem nome',
-                    price: (i.price || 0).toString(),
+                    price: parseFloat(i.price || 0).toFixed(2),
                     quantity: (i.quantity || 1).toString(),
                     inventoryId: i.inventory_id
                 })),
@@ -221,21 +244,28 @@ export const DatabaseService = {
         try {
             // Transaction could be used here but using sequential awaits for simplicity with expo-sqlite async
 
+            const parseSafeFloat = (val: any) => {
+                const s = (val || '0').toString().replace('R$', '').replace(',', '.').trim();
+                const n = parseFloat(s);
+                return isNaN(n) ? 0 : n;
+            };
+
+            const totalValueCalc = sale.products.reduce((acc, p) => acc + (parseSafeFloat(p.price) * (parseFloat(p.quantity) || 1)), 0);
+
             await database.runAsync(`
             INSERT OR REPLACE INTO sales (id, client_name, date, payment_type, installments_count, total_value)
             VALUES (?, ?, ?, ?, ?, ?)
-          `, sale.id, sale.client || 'Cliente final', sale.date, sale.paymentType, parseInt(sale.installments) || 1,
-                sale.products.reduce((acc, p) => acc + ((parseFloat(p.price) || 0) * (parseFloat(p.quantity) || 1)), 0));
+          `, sale.id, sale.client || 'Cliente final', sale.date, sale.paymentType, parseInt(sale.installments) || 1, totalValueCalc);
 
             // Items
             await database.runAsync('DELETE FROM sale_items WHERE sale_id = ?', sale.id);
             for (const p of sale.products) {
-                const safePrice = isNaN(parseFloat(p.price)) ? 0 : parseFloat(p.price);
-                const safeQty = isNaN(parseInt(p.quantity)) ? 1 : parseInt(p.quantity);
+                const safePrice = parseSafeFloat(p.price);
+                const safeQty = isNaN(parseFloat(p.quantity)) ? 1 : parseFloat(p.quantity);
                 await database.runAsync(`
-                  INSERT INTO sale_items (sale_id, product_name, price, quantity, inventory_id)
-                  VALUES (?, ?, ?, ?, ?)
-              `, sale.id, p.name || 'Produto', safePrice, safeQty, p.inventoryId || null);
+                  INSERT INTO sale_items (sale_id, product_id, product_name, price, quantity, inventory_id)
+                  VALUES (?, ?, ?, ?, ?, ?)
+              `, sale.id, p.inventoryId || p.id, p.name || 'Produto', safePrice, safeQty, p.inventoryId || null);
             }
 
             // Installments
@@ -251,11 +281,28 @@ export const DatabaseService = {
 
             if (!skipSync) {
                 // Sync to Cloud
-                const totalValue = sale.products.reduce((acc, p) => acc + ((parseFloat(p.price) || 0) * (parseFloat(p.quantity) || 1)), 0);
+                // Calcula o valor total de forma robusta removendo possíveis símbolos de moeda
+                const totalValue = sale.products.reduce((acc, p) => {
+                    const priceStr = (p.price || '0').toString().replace('R$', '').replace(',', '.').trim();
+                    const qty = parseFloat(p.quantity || '1') || 1;
+                    return acc + ((parseFloat(priceStr) || 0) * qty);
+                }, 0);
+
                 SyncService.addToQueue({
                     id: sale.id,
                     action: 'sync_sale',
-                    payload: { ...sale, totalValue },
+                    payload: {
+                        ...sale,
+                        totalValue,
+                        products: sale.products.map(p => ({
+                            ...p,
+                            id: p.inventoryId || p.id // Garante que o ID do produto seja usado pelo script do Google
+                        })),
+                        installmentList: sale.installmentList.map(inst => ({
+                            ...inst,
+                            status: inst.status // 'paid' or 'pending'
+                        }))
+                    },
                     timestamp: Date.now()
                 });
             }

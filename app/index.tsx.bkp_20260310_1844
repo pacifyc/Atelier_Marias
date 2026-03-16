@@ -238,26 +238,17 @@ export default function App() {
     const [showCategoryModal, setShowCategoryModal] = useState(false);
 
     // Fila de Impressão
-    const [printQueue, setPrintQueue] = useState<{ item: ItemEstoque; qty: number }[]>([]);
+    const [printQueue, setPrintQueue] = useState<ItemEstoque[]>([]);
     const [showPrintQueueModal, setShowPrintQueueModal] = useState(false);
     const [batchQrIncludePrice, setBatchQrIncludePrice] = useState(false);
     const [batchQrIncludeName, setBatchQrIncludeName] = useState(false);
 
-    // Modal de Quantidade de QR
-    const [showQtyModal, setShowQtyModal] = useState(false);
-    const [qtyModalItem, setQtyModalItem] = useState<ItemEstoque | null>(null);
-    const [qtyModalValue, setQtyModalValue] = useState(1);
-
-    const openQtyModal = (item: ItemEstoque) => {
-        const exists = printQueue.find(q => q.item.id === item.id);
-        if (exists) {
-            // Já está na fila: remove direto
-            setPrintQueue(prev => prev.filter(q => q.item.id !== item.id));
+    const togglePrintQueue = (item: ItemEstoque) => {
+        const index = printQueue.findIndex(q => q.id === item.id);
+        if (index >= 0) {
+            setPrintQueue(printQueue.filter(q => q.id !== item.id));
         } else {
-            // Abre popup de quantidade
-            setQtyModalItem(item);
-            setQtyModalValue(1);
-            setShowQtyModal(true);
+            setPrintQueue([...printQueue, item]);
         }
     };
 
@@ -403,14 +394,10 @@ export default function App() {
     }, []);
 
     const ensureFolders = async () => {
-        try {
-            const photosFolder = `${documentDirectory}photos/`;
-            const info = await getInfoAsync(photosFolder);
-            if (!info.exists) {
-                await makeDirectoryAsync(photosFolder, { intermediates: true });
-            }
-        } catch (e) {
-            console.error("Erro ao criar pastas:", e);
+        const photosFolder = `${documentDirectory}photos/`;
+        const info = await getInfoAsync(photosFolder);
+        if (!info.exists) {
+            await makeDirectoryAsync(photosFolder, { intermediates: true });
         }
     };
 
@@ -756,7 +743,7 @@ export default function App() {
         if (prod) {
             setEditingProduct(prod);
             setProdName(prod.name);
-            setProdPrice(prod.price ? String(prod.price).replace('.', ',') : '');
+            setProdPrice(prod.price);
             setProdImage(prod.image);
             setProdCategory(prod.category || 'Geral');
             setProdStock(prod.stock || 0);
@@ -1090,10 +1077,9 @@ export default function App() {
         </head>
         <body>
           <div class="grid">
-            ${printQueue.flatMap(({ item: prod, qty }) =>
-            Array.from({ length: qty }).map(() => {
-                const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${prod.id}`;
-                return `
+            ${printQueue.map(prod => {
+            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${prod.id}`;
+            return `
               <div class="label-container">
                 <div class="atelier-name">${appAtelierName || 'ATELIÊ'}</div>
                 ${batchQrIncludeName ? `<div class="product-name">${prod.name}</div>` : ''}
@@ -1101,7 +1087,7 @@ export default function App() {
                 <img src="${qrUrl}" class="qr-code" />
                 ${!noRef ? `<div class="ref-id">Ref: ${prod.id}</div>` : ''}
               </div>
-            `})).join('')}
+            `}).join('')}
           </div>
         </body>
       </html>
@@ -1380,13 +1366,10 @@ export default function App() {
 
             // Adicionar fotos em Base64 para cada produto
             const inventoryWithPhotos = await Promise.all(dbInventory.map(async (item) => {
-                if (item.image && item.image.startsWith('file://')) {
+                if (item.image && (await getInfoAsync(item.image)).exists) {
                     try {
-                        const info = await getInfoAsync(item.image);
-                        if (info.exists) {
-                            const base64 = await readAsStringAsync(item.image, { encoding: EncodingType.Base64 });
-                            return { ...item, imageBase64: base64 };
-                        }
+                        const base64 = await readAsStringAsync(item.image, { encoding: EncodingType.Base64 });
+                        return { ...item, imageBase64: base64 };
                     } catch (e) {
                         console.error("Erro ao converter foto para base64:", e);
                     }
@@ -1427,12 +1410,11 @@ export default function App() {
 
             if (result.canceled) return;
 
-            const fileContent = await readAsStringAsync(result.assets[0].uri, { encoding: EncodingType.UTF8 });
+            const fileContent = await readAsStringAsync(result.assets[0].uri);
             const backup = JSON.parse(fileContent);
 
-            if (!backup.sales && !backup.inventory && !backup.categories) {
-                Alert.alert('Erro', 'O arquivo selecionado não contém dados válidos de backup.');
-                return;
+            if (!backup.v || (!backup.sales && !backup.inventory)) {
+                throw new Error('Formato de backup inválido.');
             }
 
             Alert.alert("Restaurar Backup", "Isso irá substituir todos os dados atuais. Continuar?", [
@@ -1495,15 +1477,6 @@ export default function App() {
                 {
                     text: "Restaurar", onPress: async () => {
                         try {
-                            // 0. Fazer backup local das imagens dos produtos antes de apagar
-                            const currentInventory = await DatabaseService.getInventory();
-                            const imageBackupMap: Record<string, string> = {};
-                            currentInventory.forEach(item => {
-                                if (item.image) {
-                                    imageBackupMap[item.id] = item.image;
-                                }
-                            });
-
                             // 1. Limpar Tabelas Atuais
                             const db = await initDatabase();
                             await db.runAsync('DELETE FROM sales');
@@ -1517,45 +1490,15 @@ export default function App() {
                             if (data.categories) await DatabaseService.bulkSaveCategories(data.categories);
 
                             // 3. Importar Produtos
-                            if (data.products) {
-                                // Restaurar imagens salvas localmente
-                                const productsWithImages = data.products.map((p: any) => {
-                                    if (imageBackupMap[p.id]) {
-                                        p.image = imageBackupMap[p.id];
-                                    }
-                                    return p;
-                                });
-                                await DatabaseService.bulkSaveInventory(productsWithImages);
-                            }
+                            if (data.products) await DatabaseService.bulkSaveInventory(data.products);
 
                             // 4. Importar Vendas (com itens e parcelas)
                             if (data.sales) {
                                 for (const s of data.sales) {
-                                    const products = data.sale_items.filter((i: any) => i.sale_id === s.id);
-                                    let installments = data.installments.filter((i: any) => i.sale_id === s.id);
-
-                                    // FIX / FALLBACK: Se o Google Script retornou as parcelas com valor 0, calcular pelo total dos produtos
-                                    const sumInst = installments.reduce((acc: any, inst: any) => acc + parseFloat(inst.value || 0), 0);
-                                    if (sumInst === 0 && installments.length > 0) {
-                                        const totalValueCalc = products.reduce((acc: any, p: any) => {
-                                            const priceStr = (p.price || '0').toString().replace('R$', '').replace(',', '.').trim();
-                                            const qty = parseFloat(p.quantity || '1') || 1;
-                                            return acc + ((parseFloat(priceStr) || 0) * qty);
-                                        }, 0);
-                                        
-                                        if (totalValueCalc > 0) {
-                                            const valPerInst = totalValueCalc / installments.length;
-                                            installments = installments.map((inst: any) => ({
-                                                ...inst,
-                                                value: valPerInst
-                                            }));
-                                        }
-                                    }
-
                                     const sale: Venda = {
                                         ...s,
-                                        products: products,
-                                        installmentList: installments
+                                        products: data.sale_items.filter((i: any) => i.sale_id === s.id),
+                                        installmentList: data.installments.filter((i: any) => i.sale_id === s.id)
                                     };
                                     await DatabaseService.saveSale(sale, true);
                                 }
@@ -1782,8 +1725,8 @@ export default function App() {
                                     }
                                 }}
                                 onDelete={handleDeleteProduct}
-                                onAddToQueue={openQtyModal}
-                                isInQueue={printQueue.some(q => q.item.id === item.id)}
+                                onAddToQueue={togglePrintQueue}
+                                isInQueue={printQueue.some(q => q.id === item.id)}
                             />
                         )}
                     />
@@ -1874,59 +1817,6 @@ export default function App() {
                         </View>
                     </Modal>
 
-                    {/* Modal Quantidade de QR */}
-                    <Modal visible={showQtyModal} transparent animationType="fade">
-                        <View style={styles.modalBack}>
-                            <View style={[styles.scanResultCard, { width: '85%' }]}>
-                                <Text style={styles.scanResTitle}>ADICIONAR À FILA</Text>
-                                <Text style={{ fontWeight: 'bold', fontSize: 16, marginTop: 5 }}>{qtyModalItem?.name}</Text>
-                                <Text style={{ fontSize: 13, color: '#666', marginBottom: 18 }}>
-                                    R$ {parseFloat(qtyModalItem?.price || '0').toFixed(2).replace('.', ',')}
-                                </Text>
-
-                                {/* Controle de quantidade */}
-                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 20, marginBottom: 24, backgroundColor: '#f5f5f5', borderRadius: 12, paddingVertical: 10, paddingHorizontal: 20 }}>
-                                    <TouchableOpacity
-                                        onPress={() => setQtyModalValue(v => Math.max(1, v - 1))}
-                                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#ddd', justifyContent: 'center', alignItems: 'center' }}
-                                    >
-                                        <Text style={{ fontSize: 24, fontWeight: 'bold', color: '#333', lineHeight: 28 }}>−</Text>
-                                    </TouchableOpacity>
-                                    <View style={{ alignItems: 'center' }}>
-                                        <Text style={{ fontSize: 13, color: '#888' }}>QR</Text>
-                                        <Text style={{ fontSize: 28, fontWeight: 'bold', color: appTheme.dark, minWidth: 40, textAlign: 'center' }}>{qtyModalValue}</Text>
-                                    </View>
-                                    <TouchableOpacity
-                                        onPress={() => setQtyModalValue(v => v + 1)}
-                                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: appTheme.primary, justifyContent: 'center', alignItems: 'center' }}
-                                    >
-                                        <Text style={{ fontSize: 24, fontWeight: 'bold', color: '#fff', lineHeight: 28 }}>+</Text>
-                                    </TouchableOpacity>
-                                </View>
-
-                                <View style={{ flexDirection: 'row', gap: 10, width: '100%' }}>
-                                    <TouchableOpacity
-                                        style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]}
-                                        onPress={() => setShowQtyModal(false)}
-                                    >
-                                        <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
-                                    </TouchableOpacity>
-                                    <TouchableOpacity
-                                        style={[styles.resBtn, { backgroundColor: appTheme.primary, flex: 1 }]}
-                                        onPress={() => {
-                                            if (qtyModalItem) {
-                                                setPrintQueue(prev => [...prev, { item: qtyModalItem, qty: qtyModalValue }]);
-                                            }
-                                            setShowQtyModal(false);
-                                        }}
-                                    >
-                                        <Text style={{ fontWeight: 'bold', color: '#fff' }}>ADICIONAR</Text>
-                                    </TouchableOpacity>
-                                </View>
-                            </View>
-                        </View>
-                    </Modal>
-
                     {/* Modal Fila de Impressão */}
                     <Modal visible={showPrintQueueModal} transparent animationType="slide">
                         <View style={styles.modalBack}>
@@ -1966,31 +1856,13 @@ export default function App() {
                                 ) : (
                                     <>
                                         <ScrollView style={{ width: '100%', marginBottom: 15 }}>
-                                            {printQueue.map(({ item, qty }) => (
-                                                <View key={item.id} style={[styles.row, { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eee', alignItems: 'center' }]}>
+                                            {printQueue.map(item => (
+                                                <View key={item.id} style={[styles.row, { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eee' }]}>
                                                     <View style={{ flex: 1 }}>
                                                         <Text style={{ fontWeight: 'bold' }}>{item.name}</Text>
-                                                        <Text style={{ fontSize: 12, color: '#666' }}>R$ {parseFloat(item.price || '0').toFixed(2).replace('.', ',')}</Text>
+                                                        <Text style={{ fontSize: 12, color: '#666' }}>R$ {item.price.replace('.', ',')}</Text>
                                                     </View>
-                                                    {/* Controle ± de quantidade inline */}
-                                                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginRight: 10 }}>
-                                                        <TouchableOpacity
-                                                            onPress={() => setPrintQueue(prev => prev.map(q => q.item.id === item.id ? { ...q, qty: Math.max(1, q.qty - 1) } : q))}
-                                                            style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: '#ddd', justifyContent: 'center', alignItems: 'center' }}
-                                                        >
-                                                            <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#333', lineHeight: 22 }}>−</Text>
-                                                        </TouchableOpacity>
-                                                        <Text style={{ fontSize: 14, fontWeight: 'bold', color: appTheme.dark, minWidth: 28, textAlign: 'center' }}>
-                                                            QR={qty}
-                                                        </Text>
-                                                        <TouchableOpacity
-                                                            onPress={() => setPrintQueue(prev => prev.map(q => q.item.id === item.id ? { ...q, qty: q.qty + 1 } : q))}
-                                                            style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: appTheme.primary, justifyContent: 'center', alignItems: 'center' }}
-                                                        >
-                                                            <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#fff', lineHeight: 22 }}>+</Text>
-                                                        </TouchableOpacity>
-                                                    </View>
-                                                    <TouchableOpacity onPress={() => setPrintQueue(prev => prev.filter(q => q.item.id !== item.id))}>
+                                                    <TouchableOpacity onPress={() => togglePrintQueue(item)}>
                                                         <Trash2 size={20} color="#ff4d4d" />
                                                     </TouchableOpacity>
                                                 </View>
@@ -2008,7 +1880,6 @@ export default function App() {
                                                 style={[styles.resBtn, { backgroundColor: appTheme.primary, flex: 2 }]}
                                                 onPress={() => {
                                                     generateBatchPDF();
-                                                    setPrintQueue([]);
                                                     setShowPrintQueueModal(false);
                                                 }}
                                             >
@@ -2091,7 +1962,7 @@ export default function App() {
                             <TouchableOpacity onPress={() => setView('categories_list')}><ChevronLeft color={appTheme.primary} size={32} /></TouchableOpacity>
                             <Text style={[styles.topBarTitle, { color: appTheme.dark }]}>PRODUTO</Text><View style={{ width: 32 }} />
                         </View>
-                        <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 80 }}>
+                        <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled">
                             <View style={styles.formCard}>
                                 <Text style={[styles.label, { color: appTheme.primary }]}>NOME DO PRODUTO</Text>
                                 <TextInput style={styles.input} placeholder="Ex: Vestido Floral" value={prodName} onChangeText={setProdName} />

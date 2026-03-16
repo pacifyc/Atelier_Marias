@@ -30,18 +30,62 @@ function syncProduct(ss, product) {
   var headers = ['CÓDIGO DO PRODUTO', 'DESCRIÇÃO DO PRODUTO', 'VALOR', 'ESTOQUE', 'CATEGORIA', 'LOCAL DA FOTO'];
   ensureHeaders(sheet, headers);
   
+  var imageUrl = product.image || '';
+  
+  if (product.imageBase64) {
+    var driveRes = saveImageToDrive(product.id, product.imageBase64);
+    if (driveRes && driveRes.indexOf('G_SCRIPT_ERROR') === -1) {
+        imageUrl = driveRes;
+    } else if (driveRes) {
+        imageUrl = driveRes; // Write the error in the spreadsheet so we can read it!
+    }
+  }
+  
   var rowData = [
     product.id,
     product.name,
     product.price,
     product.stock,
     product.category || 'Geral',
-    product.image || ''
+    imageUrl
   ];
   
   upsertRow(sheet, 'CÓDIGO DO PRODUTO', product.id, rowData);
-  return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify({ success: true, imageUrl: imageUrl })).setMimeType(ContentService.MimeType.JSON);
 }
+
+function saveImageToDrive(filename, base64Data) {
+  try {
+    var folderName = "Atelier_Mobile_Images";
+    var folders = DriveApp.getFoldersByName(folderName);
+    var folder;
+    if (folders.hasNext()) {
+      folder = folders.next();
+    } else {
+      folder = DriveApp.createFolder(folderName);
+      folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    }
+    
+    var data = base64Data;
+    if (base64Data.indexOf('base64,') !== -1) {
+      data = base64Data.split('base64,')[1];
+    }
+    
+    var blob = Utilities.newBlob(Utilities.base64Decode(data), 'image/jpeg', filename + '.jpg');
+    
+    var files = folder.getFilesByName(filename + '.jpg');
+    if (files.hasNext()) {
+      var file = files.next();
+      file.setTrashed(true);
+    }
+    var newFile = folder.createFile(blob);
+    
+    return "https://drive.google.com/uc?export=view&id=" + newFile.getId();
+  } catch (e) {
+    return "G_SCRIPT_ERROR: " + e.message;
+  }
+}
+
 
 function syncSale(ss, sale) {
   // 1. Aba Vendas
@@ -189,6 +233,25 @@ function formatDateString(val, ss) {
   return str;
 }
 
+function parseCurrency(val) {
+  if (!val) return 0;
+  var str = val.toString().trim();
+  
+  // Remove all non-numeric characters EXCEPT comma, dot, and minus sign
+  // This gracefully handles "r$ ", "RS ", "R $", alphabetical typos, etc.
+  str = str.replace(/[^\d.,-]/g, '').trim();
+  
+  if (str.indexOf(',') !== -1) {
+      // Tem virgula (formato BR) - tiramos os possiveis pontos de milhar e trocamos a virgula por ponto
+      str = str.replace(/\./g, '').replace(/,/g, '.');
+  } else {
+      // Se nao tem virgula, ja deve estar em formato JS standard (ex: 45.00). Nao removemos os pontos!
+  }
+  
+  var num = parseFloat(str);
+  return isNaN(num) ? 0 : num;
+}
+
 function getAllData(ss) {
   var result = {
     success: true,
@@ -215,7 +278,7 @@ function getAllData(ss) {
   if (sheetProd) {
     var dataProd = sheetProd.getDataRange().getValues();
     if (dataProd.length > 1) {
-      var headers = dataProd[0];
+      var headers = dataProd[0].map(function(h) { return h ? h.toString().trim().toUpperCase() : ''; });
       var idxId = headers.indexOf('CÓDIGO DO PRODUTO');
       var idxName = headers.indexOf('DESCRIÇÃO DO PRODUTO');
       var idxPrice = headers.indexOf('VALOR');
@@ -229,7 +292,7 @@ function getAllData(ss) {
           result.products.push({
             id: row[idxId].toString(),
             name: (idxName !== -1 && row[idxName]) ? row[idxName].toString() : '',
-            price: (idxPrice !== -1 && row[idxPrice]) ? row[idxPrice].toString() : '0',
+            price: (idxPrice !== -1 && row[idxPrice]) ? parseCurrency(row[idxPrice]).toString() : '0',
             stock: (idxStock !== -1 && row[idxStock]) ? parseInt(row[idxStock]) || 0 : 0,
             category: (idxCategory !== -1 && row[idxCategory]) ? row[idxCategory].toString() : 'Geral',
             image: (idxImage !== -1 && row[idxImage]) ? row[idxImage].toString() : null,
@@ -245,12 +308,14 @@ function getAllData(ss) {
   if (sheetVendas) {
     var dataVendas = sheetVendas.getDataRange().getValues();
     if (dataVendas.length > 1) {
-      var headers = dataVendas[0];
+      var headers = dataVendas[0].map(function(h) { return h ? h.toString().trim().toUpperCase() : ''; });
       var idxId = headers.indexOf('CÓDIGO DA VENDA');
       var idxClient = headers.indexOf('CLIENTE');
       var idxDate = headers.indexOf('DATA COMPRA');
       var idxPayment = headers.indexOf('FORMA DE PAGAMENTO');
       var idxTotal = headers.indexOf('VALOR DA COMPRA');
+      if (idxTotal === -1) idxTotal = headers.indexOf('VALOR DA VENDA');
+      if (idxTotal === -1) idxTotal = headers.indexOf('VALOR');
 
       for (var i = 1; i < dataVendas.length; i++) {
         var row = dataVendas[i];
@@ -261,7 +326,7 @@ function getAllData(ss) {
             date: (idxDate !== -1) ? formatDateString(row[idxDate], ss) : '',
             paymentType: (idxPayment !== -1 && row[idxPayment]) ? row[idxPayment].toString() : 'vista',
             installments: '1', // Será ajustado no app baseado nas parcelas
-            totalValue: (idxTotal !== -1 && row[idxTotal]) ? parseFloat(row[idxTotal]) || 0 : 0
+            totalValue: (idxTotal !== -1 && row[idxTotal]) ? parseCurrency(row[idxTotal]) : 0
           });
         }
       }
@@ -273,7 +338,7 @@ function getAllData(ss) {
   if (sheetItens) {
     var dataItens = sheetItens.getDataRange().getValues();
     if (dataItens.length > 1) {
-      var headers = dataItens[0];
+      var headers = dataItens[0].map(function(h) { return h ? h.toString().trim().toUpperCase() : ''; });
       var idxSaleId = headers.indexOf('CÓDIGO DA VENDA');
       var idxProdId = headers.indexOf('CÓDIGO DO PRODUTO');
       var idxName = headers.indexOf('DESCRIÇÃO DO PRODUTO');
@@ -287,7 +352,7 @@ function getAllData(ss) {
             sale_id: row[idxSaleId].toString(),
             id: (idxProdId !== -1 && row[idxProdId]) ? row[idxProdId].toString() : '',
             name: (idxName !== -1 && row[idxName]) ? row[idxName].toString() : '',
-            price: (idxPrice !== -1 && row[idxPrice]) ? row[idxPrice].toString() : '0',
+            price: (idxPrice !== -1 && row[idxPrice]) ? parseCurrency(row[idxPrice]).toString() : '0',
             quantity: (idxQty !== -1 && row[idxQty]) ? row[idxQty].toString() : '1',
             inventoryId: (idxProdId !== -1 && row[idxProdId]) ? row[idxProdId].toString() : null
           });
@@ -301,11 +366,13 @@ function getAllData(ss) {
   if (sheetParcelas) {
     var dataParcelas = sheetParcelas.getDataRange().getValues();
     if (dataParcelas.length > 1) {
-      var headers = dataParcelas[0];
+      var headers = dataParcelas[0].map(function(h) { return h ? h.toString().trim().toUpperCase() : ''; });
       var idxSaleId = headers.indexOf('CÓDIGO DA VENDA');
       var idxNum = headers.indexOf('PARCELA');
       var idxDate = headers.indexOf('DATA');
       var idxValue = headers.indexOf('VALOR DA PARCELA');
+      if (idxValue === -1) idxValue = headers.indexOf('VALOR PARCELA');
+      if (idxValue === -1) idxValue = headers.indexOf('VALOR');
       var idxStatus = headers.indexOf('SITUAÇÃO');
 
       for (var i = 1; i < dataParcelas.length; i++) {
@@ -315,7 +382,7 @@ function getAllData(ss) {
             sale_id: row[idxSaleId].toString(),
             number: (idxNum !== -1 && row[idxNum]) ? parseInt(row[idxNum]) || 1 : 1,
             date: (idxDate !== -1) ? formatDateString(row[idxDate], ss) : '',
-            value: (idxValue !== -1 && row[idxValue]) ? parseFloat(row[idxValue]) || 0 : 0,
+            value: (idxValue !== -1 && row[idxValue]) ? parseCurrency(row[idxValue]) : 0,
             status: (idxStatus !== -1 && row[idxStatus] && row[idxStatus].toString() === 'Pago') ? 'paid' : 'pending'
           });
         }

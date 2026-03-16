@@ -6,7 +6,7 @@ export const initDatabase = async () => {
   if (db) return db;
 
   db = await SQLite.openDatabaseAsync('atelier.db');
-  
+
   // Enable foreign keys
   await db.execAsync('PRAGMA foreign_keys = ON;');
 
@@ -48,10 +48,11 @@ export const initDatabase = async () => {
     CREATE TABLE IF NOT EXISTS sale_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       sale_id TEXT NOT NULL,
+      product_id TEXT, -- This maps to CÓDIGO DO PRODUTO
       product_name TEXT NOT NULL,
       price REAL NOT NULL,
       quantity INTEGER DEFAULT 1,
-      inventory_id TEXT,
+      inventory_id TEXT, -- Keep this for backward compatibility if needed, but we'll use product_id/inventory_id
       FOREIGN KEY (sale_id) REFERENCES sales (id) ON DELETE CASCADE
     );
 
@@ -65,16 +66,30 @@ export const initDatabase = async () => {
       FOREIGN KEY (sale_id) REFERENCES sales (id) ON DELETE CASCADE
     );
      
-     -- Insert default category if not exists
-     INSERT OR IGNORE INTO categories (name) VALUES ('Geral');
+      -- Insert default category if not exists
+      INSERT OR IGNORE INTO categories (name) VALUES ('Geral');
   `);
+
+  // --- Migrations for existing databases ---
+  try {
+    // Check if product_id exists in sale_items
+    const tableInfo = await db.getAllAsync<any>("PRAGMA table_info(sale_items)");
+    const columnExists = tableInfo.some((col: any) => col.name === 'product_id');
+
+    if (!columnExists) {
+      console.log("Migrating database: Adding product_id to sale_items...");
+      await db.execAsync("ALTER TABLE sale_items ADD COLUMN product_id TEXT;");
+    }
+  } catch (e) {
+    console.error("Migration error:", e);
+  }
 
   return db;
 };
 
 export const getDb = () => {
-    if (!db) {
-        throw new Error("Database not initialized. Call initDatabase() first.");
-    }
-    return db;
+  if (!db) {
+    throw new Error("Database not initialized. Call initDatabase() first.");
+  }
+  return db;
 };

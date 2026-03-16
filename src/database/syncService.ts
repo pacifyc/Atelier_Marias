@@ -1,14 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getInfoAsync, readAsStringAsync, EncodingType } from 'expo-file-system/legacy';
 
 export const SYNC_URL_KEY = '@atelier_sync_url';
 const SYNC_QUEUE_KEY = '@atelier_sync_queue';
 
 export interface SyncItem {
     id: string;
-    action: 'sync_product' | 'sync_sale' | 'sync_category';
+    action: 'sync_product' | 'sync_sale' | 'sync_category' | 'delete_product' | 'delete_category';
     payload: any;
     timestamp: number;
 }
+
+let isProcessing = false;
 
 export const SyncService = {
     setSyncUrl: async (url: string) => {
@@ -37,6 +40,23 @@ export const SyncService = {
     },
 
     processQueue: async () => {
+        if (isProcessing) {
+            console.log('Sincronização já em andamento, aguardando...');
+            return;
+        }
+
+        const url = await SyncService.getSyncUrl();
+        if (!url) return;
+
+        isProcessing = true;
+        try {
+            await SyncService._processInternal();
+        } finally {
+            isProcessing = false;
+        }
+    },
+
+    _processInternal: async () => {
         const url = await SyncService.getSyncUrl();
         if (!url) return;
 
@@ -52,11 +72,29 @@ export const SyncService = {
 
         for (const item of queue) {
             try {
+                let finalPayload = item.payload;
+
+                // Transforma imagem local em base64 se for um sync de produto
+                if (item.action === 'sync_product' && finalPayload.image && finalPayload.image.startsWith('file://')) {
+                    try {
+                        const info = await getInfoAsync(finalPayload.image);
+                        if (info.exists) {
+                            const base64 = await readAsStringAsync(finalPayload.image, { encoding: EncodingType.Base64 });
+                            finalPayload = { ...finalPayload, imageBase64: base64 };
+                        } else {
+                            finalPayload = { ...finalPayload, image: 'APP_ERROR: File does not exist' };
+                        }
+                    } catch (e: any) {
+                        console.error('Erro ao ler imagem como base64:', e);
+                        finalPayload = { ...finalPayload, image: 'APP_ERROR: ' + e.message };
+                    }
+                }
+
                 const response = await fetch(url, {
                     method: 'POST',
                     body: JSON.stringify({
                         action: item.action,
-                        payload: item.payload
+                        payload: finalPayload
                     })
                 });
 
@@ -66,6 +104,7 @@ export const SyncService = {
                     // Se for produto e retornou URL da imagem, poderíamos atualizar o banco local
                     if (item.action === 'sync_product' && result.imageUrl) {
                         // Opcional: atualizar URL local para apontar pro Drive
+                        // Atualizaremos pelo DatabaseService no futuro caso necessário
                     }
                 } else {
                     remaining.push(item);
@@ -79,6 +118,17 @@ export const SyncService = {
         }
 
         await AsyncStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(remaining));
+
+        // Se novos itens foram adicionados durante o processamento, tenta processar novamente
+        const checkQueueStr = await AsyncStorage.getItem(SYNC_QUEUE_KEY);
+        if (checkQueueStr) {
+            const checkQueue: SyncItem[] = JSON.parse(checkQueueStr);
+            if (checkQueue.length > 0 && remaining.length < checkQueue.length) {
+                // Há novos itens (ou pelo menos a fila não está vazia e algo mudou)
+                // Chamamos recursivamente de forma controlada ou via timeout para não estourar stack
+                setTimeout(() => SyncService.processQueue(), 500);
+            }
+        }
     },
 
     downloadData: async () => {
