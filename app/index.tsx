@@ -428,7 +428,7 @@ export default function App() {
 
             const dbCategories = await DatabaseService.getCategories();
             if (dbCategories.length > 0) {
-                setCategories(dbCategories);
+                setCategories(dbCategories.map(c => c.name));
             } else {
                 setCategories(['Geral']);
             }

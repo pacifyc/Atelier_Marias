@@ -14,7 +14,8 @@ export const initDatabase = async () => {
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL
+      name TEXT UNIQUE NOT NULL,
+      size_type TEXT DEFAULT 'none' -- 'none', 'letter', 'number'
     );
 
     CREATE TABLE IF NOT EXISTS products (
@@ -24,6 +25,8 @@ export const initDatabase = async () => {
       image TEXT,
       category_id INTEGER,
       stock INTEGER DEFAULT 0,
+      size_number INTEGER, -- 32-45
+      size_letter TEXT,   -- P, M, G, GG
       FOREIGN KEY (category_id) REFERENCES categories (id)
     );
 
@@ -63,6 +66,7 @@ export const initDatabase = async () => {
       date TEXT NOT NULL,
       value REAL NOT NULL,
       status TEXT DEFAULT 'pending',
+      isLocked INTEGER DEFAULT 0, -- 0 = false, 1 = true
       FOREIGN KEY (sale_id) REFERENCES sales (id) ON DELETE CASCADE
     );
      
@@ -72,6 +76,13 @@ export const initDatabase = async () => {
 
   // --- Migrations for existing databases ---
   try {
+    // Check if isLocked exists in installments
+    const instInfo = await db.getAllAsync<any>("PRAGMA table_info(installments)");
+    if (!instInfo.some((col: any) => col.name === 'isLocked')) {
+      console.log("Migrating database: Adding isLocked to installments...");
+      await db.execAsync("ALTER TABLE installments ADD COLUMN isLocked INTEGER DEFAULT 0;");
+    }
+
     // Check if product_id exists in sale_items
     const tableInfo = await db.getAllAsync<any>("PRAGMA table_info(sale_items)");
     const columnExists = tableInfo.some((col: any) => col.name === 'product_id');
@@ -79,6 +90,20 @@ export const initDatabase = async () => {
     if (!columnExists) {
       console.log("Migrating database: Adding product_id to sale_items...");
       await db.execAsync("ALTER TABLE sale_items ADD COLUMN product_id TEXT;");
+    }
+
+    // Migration for size features
+    const catInfo = await db.getAllAsync<any>("PRAGMA table_info(categories)");
+    if (!catInfo.some(col => col.name === 'size_type')) {
+      console.log("Migrating database: Adding size_type to categories...");
+      await db.execAsync("ALTER TABLE categories ADD COLUMN size_type TEXT DEFAULT 'none';");
+    }
+
+    const prodInfo = await db.getAllAsync<any>("PRAGMA table_info(products)");
+    if (!prodInfo.some(col => col.name === 'size_number')) {
+      console.log("Migrating database: Adding size fields to products...");
+      await db.execAsync("ALTER TABLE products ADD COLUMN size_number INTEGER;");
+      await db.execAsync("ALTER TABLE products ADD COLUMN size_letter TEXT;");
     }
   } catch (e) {
     console.error("Migration error:", e);

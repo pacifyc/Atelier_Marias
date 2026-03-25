@@ -1,3 +1,14 @@
+/**
+ * BACKEND PARA ATELIER MARIAS - VERSÃO 02 (PLANILHA Ver02)
+ * Instruções:
+ * 1. Abra sua Planilha Google.
+ * 2. Vá em Extensões > Apps Script.
+ * 3. Delete todo o código atual e cole este novo.
+ * 4. Clique em 'Salvar' (ícone de disquete).
+ * 5. Clique em 'Implantar' > 'Gerenciar Implantações'.
+ * 6. Clique no lápis (editar) e em 'Versão' escolha 'Nova Versão'.
+ * 7. Clique em 'Implantar'.
+ */
 function doPost(e) {
   var data = JSON.parse(e.postData.contents);
   var action = data.action;
@@ -27,7 +38,7 @@ function doPost(e) {
 
 function syncProduct(ss, product) {
   var sheet = getOrCreateSheet(ss, 'Produtos');
-  var headers = ['CÓDIGO DO PRODUTO', 'DESCRIÇÃO DO PRODUTO', 'VALOR', 'ESTOQUE', 'CATEGORIA', 'LOCAL DA FOTO'];
+  var headers = ['CÓDIGO DO PRODUTO', 'DESCRIÇÃO DO PRODUTO', 'TAMANHO_L', 'TAMANHO_N', 'VALOR', 'ESTOQUE', 'CATEGORIA', 'LOCAL DA FOTO'];
   ensureHeaders(sheet, headers);
   
   var imageUrl = product.image || '';
@@ -44,6 +55,8 @@ function syncProduct(ss, product) {
   var rowData = [
     product.id,
     product.name,
+    product.size_letter || '',
+    product.size_number || '',
     product.price,
     product.stock,
     product.category || 'Geral',
@@ -51,12 +64,31 @@ function syncProduct(ss, product) {
   ];
   
   upsertRow(sheet, 'CÓDIGO DO PRODUTO', product.id, rowData);
+
+  // --- Salvar Histórico de Estoque ---
+  if (product.history && product.history.length > 0) {
+    var sheetHist = getOrCreateSheet(ss, 'Historico_Produtos');
+    ensureHeaders(sheetHist, ['CÓDIGO DO PRODUTO', 'DATA', 'TIPO', 'QUANTIDADE']);
+    
+    // Limpar histórico anterior deste produto para re-inserir o novo estado (seguindo o padrão do app)
+    deleteRowsByValue(sheetHist, 'CÓDIGO DO PRODUTO', product.id);
+    
+    product.history.forEach(function(h) {
+      sheetHist.appendRow([
+        product.id,
+        h.date,
+        h.type,
+        h.quantity
+      ]);
+    });
+  }
+
   return ContentService.createTextOutput(JSON.stringify({ success: true, imageUrl: imageUrl })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function saveImageToDrive(filename, base64Data) {
   try {
-    var folderName = "Atelier_Mobile_Images";
+    var folderName = "Atelier_Mobile_Images_Ver02";
     var folders = DriveApp.getFoldersByName(folderName);
     var folder;
     if (folders.hasNext()) {
@@ -127,7 +159,7 @@ function syncSale(ss, sale) {
   
   // 3. Aba Parcelas_Venda
   var sheetParcelas = getOrCreateSheet(ss, 'Parcelas_Venda');
-  var headersParcelas = ['CÓDIGO DA VENDA', 'PARCELA', 'DATA', 'VALOR DA PARCELA', 'SITUAÇÃO'];
+  var headersParcelas = ['CÓDIGO DA VENDA', 'PARCELA', 'DATA', 'VALOR DA PARCELA', 'SITUAÇÃO', 'TRAVADA'];
   ensureHeaders(sheetParcelas, headersParcelas);
   
   deleteRowsByValue(sheetParcelas, 'CÓDIGO DA VENDA', sale.id);
@@ -139,7 +171,8 @@ function syncSale(ss, sale) {
         inst.number,
         inst.date,
         inst.value,
-        inst.status === 'paid' ? 'Pago' : 'Pendente'
+        inst.status === 'paid' ? 'Pago' : 'Pendente',
+        inst.isLocked ? 'Sim' : 'Não'
       ];
       sheetParcelas.appendRow(rowParcela);
     });
@@ -148,12 +181,21 @@ function syncSale(ss, sale) {
   return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
 }
 
-function syncCategory(ss, categoryName) {
+function syncCategory(ss, category) {
   var sheet = getOrCreateSheet(ss, 'Categorias');
-  var headers = ['CATEGORIA'];
+  var headers = ['CATEGORIA', 'TIPO_TAMANHO'];
   ensureHeaders(sheet, headers);
   
-  upsertRow(sheet, 'CATEGORIA', categoryName, [categoryName]);
+  var tipoTamanho = "";
+  if (category.size_type === 'letter') tipoTamanho = "Literal";
+  else if (category.size_type === 'number') tipoTamanho = "Numeral";
+  
+  var rowData = [
+    category.name,
+    tipoTamanho
+  ];
+  
+  upsertRow(sheet, 'CATEGORIA', category.name, rowData);
   return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -259,7 +301,8 @@ function getAllData(ss) {
     products: [],
     sales: [],
     sale_items: [],
-    installments: []
+    installments: [],
+    product_history: []
   };
 
   // Categorias
@@ -267,8 +310,25 @@ function getAllData(ss) {
   if (sheetCat) {
     var dataCat = sheetCat.getDataRange().getValues();
     if (dataCat.length > 1) {
+      var headers = dataCat[0].map(function(h) { return h ? h.toString().trim().toUpperCase() : ''; });
+      var idxName = headers.indexOf('CATEGORIA');
+      var idxType = headers.indexOf('TIPO_TAMANHO');
+
       for (var i = 1; i < dataCat.length; i++) {
-        if (dataCat[i][0]) result.categories.push(dataCat[i][0].toString());
+        var row = dataCat[i];
+        if (idxName !== -1 && row[idxName]) {
+          var sType = 'none';
+          if (idxType !== -1 && row[idxType]) {
+            var val = row[idxType].toString();
+            if (val === 'Literal') sType = 'letter';
+            else if (val === 'Numeral') sType = 'number';
+          }
+          result.categories.push({
+            id: i, // Use row index as ID if not present
+            name: row[idxName].toString(),
+            size_type: sType
+          });
+        }
       }
     }
   }
@@ -284,6 +344,8 @@ function getAllData(ss) {
       var idxPrice = headers.indexOf('VALOR');
       var idxStock = headers.indexOf('ESTOQUE');
       var idxCategory = headers.indexOf('CATEGORIA');
+      var idxSizeN = headers.indexOf('TAMANHO_N');
+      var idxSizeL = headers.indexOf('TAMANHO_L');
       var idxImage = headers.indexOf('LOCAL DA FOTO');
 
       for (var i = 1; i < dataProd.length; i++) {
@@ -295,8 +357,10 @@ function getAllData(ss) {
             price: (idxPrice !== -1 && row[idxPrice]) ? parseCurrency(row[idxPrice]).toString() : '0',
             stock: (idxStock !== -1 && row[idxStock]) ? parseInt(row[idxStock]) || 0 : 0,
             category: (idxCategory !== -1 && row[idxCategory]) ? row[idxCategory].toString() : 'Geral',
+            size_number: (idxSizeN !== -1 && row[idxSizeN]) ? parseInt(row[idxSizeN]) : null,
+            size_letter: (idxSizeL !== -1 && row[idxSizeL]) ? row[idxSizeL].toString() : null,
             image: (idxImage !== -1 && row[idxImage]) ? row[idxImage].toString() : null,
-            history: [] // Histórico não é persistido no Google Sheets atualmente
+            history: [] 
           });
         }
       }
@@ -325,7 +389,7 @@ function getAllData(ss) {
             client: (idxClient !== -1 && row[idxClient]) ? row[idxClient].toString() : '',
             date: (idxDate !== -1) ? formatDateString(row[idxDate], ss) : '',
             paymentType: (idxPayment !== -1 && row[idxPayment]) ? row[idxPayment].toString() : 'vista',
-            installments: '1', // Será ajustado no app baseado nas parcelas
+            installments: '', // Será ajustado no app baseado nas parcelas
             totalValue: (idxTotal !== -1 && row[idxTotal]) ? parseCurrency(row[idxTotal]) : 0
           });
         }
@@ -374,6 +438,7 @@ function getAllData(ss) {
       if (idxValue === -1) idxValue = headers.indexOf('VALOR PARCELA');
       if (idxValue === -1) idxValue = headers.indexOf('VALOR');
       var idxStatus = headers.indexOf('SITUAÇÃO');
+      var idxLocked = headers.indexOf('TRAVADA');
 
       for (var i = 1; i < dataParcelas.length; i++) {
         var row = dataParcelas[i];
@@ -383,20 +448,37 @@ function getAllData(ss) {
             number: (idxNum !== -1 && row[idxNum]) ? parseInt(row[idxNum]) || 1 : 1,
             date: (idxDate !== -1) ? formatDateString(row[idxDate], ss) : '',
             value: (idxValue !== -1 && row[idxValue]) ? parseCurrency(row[idxValue]) : 0,
-            status: (idxStatus !== -1 && row[idxStatus] && row[idxStatus].toString() === 'Pago') ? 'paid' : 'pending'
+            status: (idxStatus !== -1 && row[idxStatus] && row[idxStatus].toString() === 'Pago') ? 'paid' : 'pending',
+            isLocked: (idxLocked !== -1 && row[idxLocked] && row[idxLocked].toString() === 'Sim')
           });
         }
       }
     }
   }
 
-  // Ajustar número de parcelas na venda
-  if (result.sales && result.installments) {
-      for (var i = 0; i < result.sales.length; i++) {
-          var saleId = result.sales[i].id;
-          var count = result.installments.filter(function(inst) { return inst.sale_id === saleId; }).length;
-          result.sales[i].installments = count > 0 ? count.toString() : '1';
+  // Histórico de Produtos
+  var sheetHist = ss.getSheetByName('Historico_Produtos');
+  if (sheetHist) {
+    var dataHist = sheetHist.getDataRange().getValues();
+    if (dataHist.length > 1) {
+      var headers = dataHist[0].map(function(h) { return h ? h.toString().trim().toUpperCase() : ''; });
+      var idxProdId = headers.indexOf('CÓDIGO DO PRODUTO');
+      var idxDate = headers.indexOf('DATA');
+      var idxType = headers.indexOf('TIPO');
+      var idxQty = headers.indexOf('QUANTIDADE');
+
+      for (var i = 1; i < dataHist.length; i++) {
+        var row = dataHist[i];
+        if (idxProdId !== -1 && row[idxProdId]) {
+          result.product_history.push({
+            product_id: row[idxProdId].toString(),
+            date: (idxDate !== -1) ? row[idxDate].toString() : '',
+            type: (idxType !== -1) ? row[idxType].toString() : 'input',
+            quantity: (idxQty !== -1) ? parseInt(row[idxQty]) || 0 : 0
+          });
+        }
       }
+    }
   }
 
   return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);

@@ -41,7 +41,7 @@ export const SyncService = {
 
     processQueue: async () => {
         if (isProcessing) {
-            console.log('Sincronização já em andamento, aguardando...');
+            console.log('[SyncService] Sincronização automática em andamento...');
             return;
         }
 
@@ -66,9 +66,9 @@ export const SyncService = {
         const queue: SyncItem[] = JSON.parse(queueStr);
         if (queue.length === 0) return;
 
-        console.log(`Iniciando sincronização de ${queue.length} itens...`);
+        console.log(`[SyncService] Iniciando envio automático de ${queue.length} itens pendentes...`);
 
-        const remaining: SyncItem[] = [];
+        const processedIds: string[] = [];
 
         for (const item of queue) {
             try {
@@ -101,31 +101,25 @@ export const SyncService = {
                 const result = await response.json();
                 if (result.success) {
                     console.log(`Item ${item.id} sincronizado com sucesso.`);
-                    // Se for produto e retornou URL da imagem, poderíamos atualizar o banco local
-                    if (item.action === 'sync_product' && result.imageUrl) {
-                        // Opcional: atualizar URL local para apontar pro Drive
-                        // Atualizaremos pelo DatabaseService no futuro caso necessário
-                    }
+                    processedIds.push(item.id + item.action); // Usamos ID + ação para garantir unicidade na fila
                 } else {
-                    remaining.push(item);
+                    console.error(`Falha no script para o item ${item.id}:`, result.error);
                 }
             } catch (error) {
-                console.error(`Erro ao sincronizar item ${item.id}:`, error);
-                remaining.push(item);
-                // Provavelmente sem internet, interromper processamento
+                console.error(`Erro de conexão ao sincronizar item ${item.id}:`, error);
+                // Provavelmente sem internet, interromper processamento para tentar mais tarde
                 break;
             }
         }
 
-        await AsyncStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(remaining));
+        // Remova apenas o que foi processado da fila ATUAL (que pode ter novos itens agora)
+        const currentQueueStr = await AsyncStorage.getItem(SYNC_QUEUE_KEY);
+        if (currentQueueStr) {
+            const currentQueue: SyncItem[] = JSON.parse(currentQueueStr);
+            const remaining = currentQueue.filter(item => !processedIds.includes(item.id + item.action));
+            await AsyncStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(remaining));
 
-        // Se novos itens foram adicionados durante o processamento, tenta processar novamente
-        const checkQueueStr = await AsyncStorage.getItem(SYNC_QUEUE_KEY);
-        if (checkQueueStr) {
-            const checkQueue: SyncItem[] = JSON.parse(checkQueueStr);
-            if (checkQueue.length > 0 && remaining.length < checkQueue.length) {
-                // Há novos itens (ou pelo menos a fila não está vazia e algo mudou)
-                // Chamamos recursivamente de forma controlada ou via timeout para não estourar stack
+            if (remaining.length > 0 && processedIds.length > 0) {
                 setTimeout(() => SyncService.processQueue(), 500);
             }
         }

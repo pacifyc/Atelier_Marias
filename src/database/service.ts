@@ -17,7 +17,23 @@ export interface ItemEstoque {
     image: string | null;
     category?: string;
     stock: number;
+    size_number?: number | null;
+    size_letter?: string | null;
     history: Array<{ date: string; type: 'input' | 'output' | 'sale'; quantity: number }>;
+}
+
+export interface Category {
+    id: number;
+    name: string;
+    size_type: 'none' | 'letter' | 'number';
+}
+
+export interface Parcela {
+    number: number;
+    date: string;
+    value: number;
+    status: 'pending' | 'paid';
+    isLocked?: boolean;
 }
 
 export interface Venda {
@@ -27,7 +43,7 @@ export interface Venda {
     products: Produto[];
     paymentType: 'vista' | 'parcelado';
     installments: string;
-    installmentList: any[]; // Using any for simplicity in first step, should type properly
+    installmentList: Parcela[];
     totalValue: number;
 }
 
@@ -38,23 +54,23 @@ export const DatabaseService = {
     },
 
     // --- Categories ---
-    getCategories: async (): Promise<string[]> => {
+    getCategories: async (): Promise<Category[]> => {
         const database = await initDatabase();
-        const result = await database.getAllAsync<{ name: string }>('SELECT name FROM categories ORDER BY name');
-        return result.map(row => row.name);
+        const result = await database.getAllAsync<Category>('SELECT * FROM categories ORDER BY name');
+        return result;
     },
 
-    addCategory: async (name: string, skipSync: boolean = false): Promise<boolean> => {
+    addCategory: async (name: string, size_type: 'none' | 'letter' | 'number' = 'none', skipSync: boolean = false): Promise<boolean> => {
         const database = await initDatabase();
         try {
-            await database.runAsync('INSERT OR IGNORE INTO categories (name) VALUES (?)', name);
+            await database.runAsync('INSERT OR IGNORE INTO categories (name, size_type) VALUES (?, ?)', name, size_type);
 
             if (!skipSync) {
                 // Sync to Cloud
                 SyncService.addToQueue({
                     id: name,
                     action: 'sync_category',
-                    payload: name,
+                    payload: { name, size_type },
                     timestamp: Date.now()
                 });
             }
@@ -112,6 +128,8 @@ export const DatabaseService = {
                 image: p.image,
                 category: p.category_name || 'Geral',
                 stock: p.stock || 0,
+                size_number: p.size_number,
+                size_letter: p.size_letter,
                 history: history as any
             });
         }
@@ -144,9 +162,9 @@ export const DatabaseService = {
 
 
             await database.runAsync(`
-            INSERT OR REPLACE INTO products (id, name, price, image, category_id, stock)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `, product.id, product.name || 'Sem nome', safePrice, product.image, categoryId, product.stock || 0);
+            INSERT OR REPLACE INTO products (id, name, price, image, category_id, stock, size_number, size_letter)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, product.id, product.name || 'Sem nome', safePrice, product.image, categoryId, product.stock || 0, product.size_number || null, product.size_letter || null);
 
             // 3. Update History 
             // Strategy: We delete old history and re-insert is too aggressive? 
@@ -232,7 +250,8 @@ export const DatabaseService = {
                     number: inst.number,
                     date: inst.date,
                     value: inst.value,
-                    status: inst.status
+                    status: inst.status,
+                    isLocked: !!inst.isLocked
                 }))
             });
         }
@@ -273,9 +292,9 @@ export const DatabaseService = {
             if (sale.installmentList) {
                 for (const inst of sale.installmentList) {
                     await database.runAsync(`
-                      INSERT INTO installments (sale_id, number, date, value, status)
-                      VALUES (?, ?, ?, ?, ?)
-                  `, sale.id, inst.number, inst.date, inst.value, inst.status);
+                      INSERT INTO installments (sale_id, number, date, value, status, isLocked)
+                      VALUES (?, ?, ?, ?, ?, ?)
+                  `, sale.id, inst.number, inst.date, inst.value, inst.status, inst.isLocked ? 1 : 0);
                 }
             }
 
@@ -339,10 +358,10 @@ export const DatabaseService = {
         }
     },
 
-    // Custom method to bulk save categories (for migration)
-    bulkSaveCategories: async (categories: string[], skipSync: boolean = true) => {
+    // Custom method to bulk save categories (for migration/sync)
+    bulkSaveCategories: async (categories: Category[], skipSync: boolean = true) => {
         for (const cat of categories) {
-            await DatabaseService.addCategory(cat, skipSync);
+            await DatabaseService.addCategory(cat.name, cat.size_type, skipSync);
         }
     }
 };
