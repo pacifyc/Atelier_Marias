@@ -233,8 +233,10 @@ export default function App() {
 
     // Dados de Categorias
     const [categories, setCategories] = useState<string[]>(['Geral']);
+    const [categoriesData, setCategoriesData] = useState<any[]>([]);
     const [selectedCategory, setSelectedCategory] = useState<string>('Geral');
     const [newCategoryName, setNewCategoryName] = useState('');
+    const [newCategorySizeType, setNewCategorySizeType] = useState<'none' | 'letter' | 'number'>('none');
     const [showCategoryModal, setShowCategoryModal] = useState(false);
 
     // Fila de Impressão
@@ -346,6 +348,7 @@ export default function App() {
     const [installmentList, setInstallmentList] = useState<Parcela[]>([]);
     const [showPicker, setShowPicker] = useState(false);
     const [showInstallmentsEditor, setShowInstallmentsEditor] = useState(false);
+    const skipGenerateRef = React.useRef(false);
 
     // Estado do Formulário QR/Estoque
     const [prodName, setProdName] = useState('');
@@ -353,6 +356,8 @@ export default function App() {
     const [prodImage, setProdImage] = useState<string | null>(null);
     const [prodCategory, setProdCategory] = useState('Geral');
     const [prodStock, setProdStock] = useState(0);
+    const [prodSizeLetter, setProdSizeLetter] = useState('');
+    const [prodSizeNumber, setProdSizeNumber] = useState('');
     const [prodHistory, setProdHistory] = useState<Array<{ date: string; type: 'input' | 'output' | 'sale'; quantity: number }>>([]);
     const [showProductReportModal, setShowProductReportModal] = useState(false);
 
@@ -372,6 +377,10 @@ export default function App() {
     const [editingInstIdx, setEditingInstIdx] = useState<number | null>(null);
     const [tempInstValue, setTempInstValue] = useState('');
     const [tempInstDate, setTempInstDate] = useState('');
+    const [showProductSearchModal, setShowProductSearchModal] = useState(false);
+    const [activeProductIndex, setActiveProductIndex] = useState<number | null>(null);
+    const [prodSearchQuery, setProdSearchQuery] = useState('');
+    const [selectedProductForSale, setSelectedProductForSale] = useState<ItemEstoque | null>(null);
 
     const handlePickLogo = async () => {
         const result = await ImagePicker.launchImageLibraryAsync({
@@ -415,7 +424,13 @@ export default function App() {
     };
 
     useEffect(() => {
-        if (view === 'form') generateInstallments();
+        if (view === 'form') {
+            if (skipGenerateRef.current) {
+                skipGenerateRef.current = false;
+                return;
+            }
+            generateInstallments();
+        }
     }, [installments, paymentType, date, products, view]);
 
     const loadData = async () => {
@@ -429,8 +444,10 @@ export default function App() {
             const dbCategories = await DatabaseService.getCategories();
             if (dbCategories.length > 0) {
                 setCategories(dbCategories.map(c => c.name));
+                setCategoriesData(dbCategories);
             } else {
                 setCategories(['Geral']);
+                setCategoriesData([{ name: 'Geral', size_type: 'none' }]);
             }
 
             // Load settings
@@ -583,10 +600,27 @@ export default function App() {
             setClient(sale.client);
             setDate(sale.date);
             setProducts(sale.products);
-            setPaymentType(sale.paymentType || 'vista');
-            setInstallments(sale.installments || '1');
-            setInstallmentList(sale.installmentList || []);
-            setShowInstallmentsEditor(false);
+            const pType = sale.paymentType || 'vista';
+            setPaymentType(pType);
+            
+            const list = sale.installmentList || [];
+            
+            // Inferir número de parcelas pela lista se installments_count estiver errado no BD
+            let instStr = sale.installments || '1';
+            if (list.length > 1) {
+                instStr = list.length.toString();
+            }
+            setInstallments(instStr);
+            
+            // Travar todas as parcelas para preservar datas e valores individuais
+            const lockedList = list.map(inst => ({ ...inst, isLocked: true }));
+            setInstallmentList(lockedList);
+            
+            // Abrir o editor automaticamente se for parcelado
+            setShowInstallmentsEditor(pType === 'parcelado');
+            
+            // Bloqueia a regeneração automática de parcelas para esta abertura
+            skipGenerateRef.current = true;
         } else {
             setEditingSale(null);
             setClient(''); setDate(new Date().toISOString().split('T')[0]);
@@ -606,6 +640,29 @@ export default function App() {
             newProducts[idx][field] = value;
         }
         setProducts(newProducts);
+    };
+
+    const openProductSearchModal = (idx: number) => {
+        setActiveProductIndex(idx);
+        setProdSearchQuery('');
+        setSelectedProductForSale(null);
+        setShowProductSearchModal(true);
+    };
+
+    const confirmProductSelection = () => {
+        if (activeProductIndex !== null && selectedProductForSale) {
+            const newProducts = [...products];
+            newProducts[activeProductIndex] = {
+                ...newProducts[activeProductIndex],
+                name: selectedProductForSale.name,
+                price: selectedProductForSale.price.toString(),
+                inventoryId: selectedProductForSale.id
+            };
+            setProducts(newProducts);
+        }
+        setShowProductSearchModal(false);
+        setActiveProductIndex(null);
+        setSelectedProductForSale(null);
     };
 
     const handleSaveSale = async () => {
@@ -761,6 +818,8 @@ export default function App() {
             setProdCategory(prod.category || 'Geral');
             setProdStock(prod.stock || 0);
             setProdHistory(prod.history || []);
+            setProdSizeLetter(prod.size_letter || '');
+            setProdSizeNumber(prod.size_number ? String(prod.size_number) : '');
         } else {
             setEditingProduct(null);
             setProdName('');
@@ -769,6 +828,8 @@ export default function App() {
             setProdCategory(selectedCategory || 'Geral');
             setProdStock(0);
             setProdHistory([]);
+            setProdSizeLetter('');
+            setProdSizeNumber('');
         }
         setView('qr_form');
     };
@@ -863,7 +924,9 @@ export default function App() {
                 image: finalImagePath || null,
                 category: prodCategory,
                 stock: prodStock,
-                history: prodHistory
+                history: prodHistory,
+                size_letter: prodSizeLetter || null,
+                size_number: prodSizeNumber ? parseInt(prodSizeNumber) : null
             };
             const updated = editingProduct ? inventory.map(p => p.id === editingProduct.id ? prodData : p) : [prodData, ...inventory];
             setInventory(updated);
@@ -874,6 +937,7 @@ export default function App() {
             if (!categories.includes(prodCategory)) {
                 const newCats = [...categories, prodCategory];
                 setCategories(newCats);
+                setCategoriesData([...categoriesData, { name: prodCategory, size_type: 'none' }]);
                 await DatabaseService.addCategory(prodCategory);
             }
 
@@ -1209,8 +1273,10 @@ export default function App() {
         const newCat = newCategoryName.trim();
         const updated = [...categories, newCat];
         setCategories(updated);
-        DatabaseService.addCategory(newCat);
+        setCategoriesData([...categoriesData, { name: newCat, size_type: newCategorySizeType }]);
+        DatabaseService.addCategory(newCat, newCategorySizeType);
         setNewCategoryName('');
+        setNewCategorySizeType('none');
         setShowCategoryModal(false);
         setSelectedCategory(newCategoryName.trim());
     };
@@ -1273,12 +1339,17 @@ export default function App() {
 
     const filteredInventory = useMemo(() => {
         return inventory.filter(p => {
-            const matchesCategory = (p.category || 'Geral') === selectedCategory;
+            const matchesCategory = selectedCategory === 'Geral' ? true : (p.category || 'Geral') === selectedCategory;
             const matchesSearch = p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
                 p.price.toString().includes(searchQuery);
             return matchesCategory && matchesSearch;
         });
     }, [inventory, selectedCategory, searchQuery]);
+
+    const filteredProductsForSearch = useMemo(() => {
+        const query = prodSearchQuery.toLowerCase();
+        return inventory.filter(p => p.name.toLowerCase().includes(query));
+    }, [inventory, prodSearchQuery]);
 
     const filteredSales = useMemo(() => {
         return sales.filter(s => {
@@ -1442,18 +1513,33 @@ export default function App() {
                         // Se for backup V2, processamos as fotos
                         if (backup.v === 2 && backup.inventory) {
                             await ensureFolders();
-                            for (const item of backup.inventory) {
+                            const baseTs = Date.now();
+                            for (let idx = 0; idx < backup.inventory.length; idx++) {
+                                const item = backup.inventory[idx];
                                 if (item.imageBase64) {
+                                    // Tem base64: grava arquivo local com nome único
                                     try {
-                                        const filename = `prod_${Date.now()}_restored.jpg`;
+                                        const filename = `prod_${baseTs}_${idx}_restored.jpg`;
                                         const permanentPath = `${documentDirectory}photos/${filename}`;
                                         await writeAsStringAsync(permanentPath, item.imageBase64, { encoding: EncodingType.Base64 });
                                         item.image = permanentPath;
                                         delete item.imageBase64;
                                     } catch (e) {
                                         console.error("Erro ao restaurar imagem:", e);
+                                        item.image = null;
+                                    }
+                                } else if (item.image && item.image.startsWith('file://')) {
+                                    // Sem base64 mas tem path local: verifica se o arquivo ainda existe
+                                    try {
+                                        const info = await getInfoAsync(item.image);
+                                        if (!info.exists) {
+                                            item.image = null; // Arquivo não existe no dispositivo atual
+                                        }
+                                    } catch (e) {
+                                        item.image = null;
                                     }
                                 }
+                                // URLs https:// (ex: Google Drive) são mantidas como estão
                             }
                         }
 
@@ -1518,13 +1604,38 @@ export default function App() {
 
                             // 3. Importar Produtos
                             if (data.products) {
-                                // Restaurar imagens salvas localmente
-                                const productsWithImages = data.products.map((p: any) => {
+                                // Restaurar imagens salvas localmente e baixar via base64 se disponível na nuvem
+                                await ensureFolders();
+                                const baseTs = Date.now();
+                                const productsWithImages: any[] = [];
+                                for (let idx = 0; idx < data.products.length; idx++) {
+                                    const p = { ...data.products[idx] };
+                                    // Prioridade 1: imagem local já existente com o mesmo ID
                                     if (imageBackupMap[p.id]) {
-                                        p.image = imageBackupMap[p.id];
+                                        const localInfo = await getInfoAsync(imageBackupMap[p.id]).catch(() => ({ exists: false }));
+                                        if (localInfo.exists) {
+                                            p.image = imageBackupMap[p.id];
+                                        } else {
+                                            p.image = null;
+                                        }
+                                    // Prioridade 2: imagem em base64 enviada pela nuvem
+                                    } else if (p.imageBase64) {
+                                        try {
+                                            const filename = `prod_${baseTs}_${idx}_cloud.jpg`;
+                                            const permanentPath = `${documentDirectory}photos/${filename}`;
+                                            await writeAsStringAsync(permanentPath, p.imageBase64, { encoding: EncodingType.Base64 });
+                                            p.image = permanentPath;
+                                            delete p.imageBase64;
+                                        } catch (e) {
+                                            console.error("Erro ao restaurar imagem da nuvem:", e);
+                                            p.image = null;
+                                        }
+                                    } else {
+                                        // Sem imagem disponível
+                                        p.image = null;
                                     }
-                                    return p;
-                                });
+                                    productsWithImages.push(p);
+                                }
                                 await DatabaseService.bulkSaveInventory(productsWithImages);
                             }
 
@@ -1788,10 +1899,12 @@ export default function App() {
                         )}
                     />
 
-                    <TouchableOpacity style={[styles.fab, { backgroundColor: appTheme.primary }]} onPress={() => {
-                        setProdCategory(selectedCategory);
-                        openQrForm();
-                    }}><Plus color="#fff" size={32} /></TouchableOpacity>
+                    {selectedCategory !== 'Geral' && (
+                        <TouchableOpacity style={[styles.fab, { backgroundColor: appTheme.primary }]} onPress={() => {
+                            setProdCategory(selectedCategory);
+                            openQrForm();
+                        }}><Plus color="#fff" size={32} /></TouchableOpacity>
+                    )}
 
                     <TouchableOpacity
                         style={[styles.fab, { left: 20, backgroundColor: '#fff', borderWidth: 2, borderColor: appTheme.primary }]}
@@ -1815,7 +1928,31 @@ export default function App() {
                                     onChangeText={setNewCategoryName}
                                     autoFocus
                                 />
-                                <View style={{ flexDirection: 'row', gap: 10, marginTop: 10, width: '100%' }}>
+                                <View style={{ marginTop: 15, width: '100%', alignItems: 'flex-start', paddingHorizontal: 5 }}>
+                                    <Text style={{ fontSize: 12, fontWeight: 'bold', color: appTheme.primary, marginBottom: 10 }}>TAMANHO</Text>
+                                    
+                                    <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }} onPress={() => setNewCategorySizeType('none')}>
+                                        <View style={{ width: 22, height: 22, borderRadius: 11, borderWidth: 2, borderColor: newCategorySizeType === 'none' ? appTheme.primary : '#ccc', justifyContent: 'center', alignItems: 'center' }}>
+                                            {newCategorySizeType === 'none' && <View style={{ width: 12, height: 12, borderRadius: 6, backgroundColor: appTheme.primary }} />}
+                                        </View>
+                                        <Text style={{ marginLeft: 10, color: newCategorySizeType === 'none' ? '#333' : '#666', fontSize: 15 }}>NENHUM</Text>
+                                    </TouchableOpacity>
+
+                                    <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }} onPress={() => setNewCategorySizeType('letter')}>
+                                        <View style={{ width: 22, height: 22, borderRadius: 11, borderWidth: 2, borderColor: newCategorySizeType === 'letter' ? appTheme.primary : '#ccc', justifyContent: 'center', alignItems: 'center' }}>
+                                            {newCategorySizeType === 'letter' && <View style={{ width: 12, height: 12, borderRadius: 6, backgroundColor: appTheme.primary }} />}
+                                        </View>
+                                        <Text style={{ marginLeft: 10, color: newCategorySizeType === 'letter' ? '#333' : '#666', fontSize: 15 }}>LITERAL (P / M / G / GG)</Text>
+                                    </TouchableOpacity>
+
+                                    <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center' }} onPress={() => setNewCategorySizeType('number')}>
+                                        <View style={{ width: 22, height: 22, borderRadius: 11, borderWidth: 2, borderColor: newCategorySizeType === 'number' ? appTheme.primary : '#ccc', justifyContent: 'center', alignItems: 'center' }}>
+                                            {newCategorySizeType === 'number' && <View style={{ width: 12, height: 12, borderRadius: 6, backgroundColor: appTheme.primary }} />}
+                                        </View>
+                                        <Text style={{ marginLeft: 10, color: newCategorySizeType === 'number' ? '#333' : '#666', fontSize: 15 }}>NUMERAL (32 AO 45)</Text>
+                                    </TouchableOpacity>
+                                </View>
+                                <View style={{ flexDirection: 'row', gap: 10, marginTop: 20, width: '100%' }}>
                                     <TouchableOpacity style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]} onPress={() => setShowCategoryModal(false)}>
                                         <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
                                     </TouchableOpacity>
@@ -2111,6 +2248,41 @@ export default function App() {
                                     ))}
                                 </ScrollView>
 
+                                {(() => {
+                                    const catData = categoriesData.find(c => c.name === prodCategory);
+                                    const type = catData ? catData.size_type : 'none';
+                                    
+                                    if (type === 'letter') {
+                                        return (
+                                            <View style={{ marginBottom: 15 }}>
+                                                <Text style={[styles.label, { color: appTheme.primary }]}>TAMANHO (LITERAL)</Text>
+                                                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                                                    {['P', 'M', 'G', 'GG'].map(s => (
+                                                        <TouchableOpacity key={s} style={[styles.catChip, prodSizeLetter === s && { backgroundColor: appTheme.primary, borderColor: appTheme.primary }, { marginRight: 8 }]} onPress={() => setProdSizeLetter(s)}>
+                                                            <Text style={[styles.catChipText, prodSizeLetter === s && { color: '#fff' }]}>{s}</Text>
+                                                        </TouchableOpacity>
+                                                    ))}
+                                                </ScrollView>
+                                            </View>
+                                        );
+                                    } else if (type === 'number') {
+                                        const numSizes = Array.from({length: 14}, (_, i) => String(32 + i));
+                                        return (
+                                            <View style={{ marginBottom: 15 }}>
+                                                <Text style={[styles.label, { color: appTheme.primary }]}>TAMANHO (NUMERAL)</Text>
+                                                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                                                    {numSizes.map(s => (
+                                                        <TouchableOpacity key={s} style={[styles.catChip, prodSizeNumber === s && { backgroundColor: appTheme.primary, borderColor: appTheme.primary }, { marginRight: 8 }]} onPress={() => setProdSizeNumber(s)}>
+                                                            <Text style={[styles.catChipText, prodSizeNumber === s && { color: '#fff' }]}>{s}</Text>
+                                                        </TouchableOpacity>
+                                                    ))}
+                                                </ScrollView>
+                                            </View>
+                                        );
+                                    }
+                                    return null;
+                                })()}
+
                                 <Text style={[styles.label, { color: appTheme.primary }]}>ESTOQUE</Text>
                                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 15 }}>
                                     <View style={[styles.input, { flex: 1, marginBottom: 0, justifyContent: 'center' }]}>
@@ -2354,7 +2526,13 @@ export default function App() {
                             </View>
                             {products.map((p, i) => (
                                 <View key={i} style={styles.prodForm}>
-                                    <TextInput style={[styles.input, { flex: 3, marginBottom: 0 }]} placeholder="Nome do Produto" value={p.name} onChangeText={v => handleUpdateProductInSale(i, 'name', v)} />
+                                    <TextInput
+                                        style={[styles.input, { flex: 3, marginBottom: 0 }]}
+                                        placeholder="Nome do Produto"
+                                        value={p.name}
+                                        onFocus={() => openProductSearchModal(i)}
+                                        showSoftInputOnFocus={false}
+                                    />
                                     <TextInput style={[styles.input, { flex: 1, marginBottom: 0, textAlign: 'center' }]} placeholder="1" keyboardType="number-pad" value={p.quantity} onChangeText={v => handleUpdateProductInSale(i, 'quantity', v)} />
                                     <TextInput style={[styles.input, { flex: 2, marginBottom: 0, textAlign: 'center' }]} placeholder="R$ 0,00" keyboardType="default" value={p.price.replace('.', ',')} onChangeText={v => handleUpdateProductInSale(i, 'price', v)} />
                                     {products.length > 1 && (
@@ -2469,6 +2647,73 @@ export default function App() {
                             </View>
                         </Modal>
                     )}
+
+                    {showProductSearchModal && (
+                        <Modal visible={showProductSearchModal} transparent animationType="fade">
+                            <View style={styles.modalBack}>
+                                <View style={styles.searchModalCard}>
+                                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                                        <Text style={[styles.topBarTitle, { color: appTheme.primary, fontSize: 18 }]}>PESQUISAR PRODUTO</Text>
+                                        <TouchableOpacity onPress={() => setShowProductSearchModal(false)}><X size={24} color="#666" /></TouchableOpacity>
+                                    </View>
+
+                                    <View style={[styles.searchBar, { marginHorizontal: 0, marginBottom: 15 }]}>
+                                        <Search size={20} color="#666" style={{ marginLeft: 10 }} />
+                                        <TextInput
+                                            style={styles.searchInput}
+                                            placeholder="Digite o nome do produto..."
+                                            value={prodSearchQuery}
+                                            onChangeText={setProdSearchQuery}
+                                            autoFocus
+                                        />
+                                    </View>
+
+                                    <FlatList
+                                        data={filteredProductsForSearch}
+                                        keyExtractor={(item) => item.id}
+                                        renderItem={({ item }) => (
+                                            <TouchableOpacity
+                                                style={[styles.searchResultItem, selectedProductForSale?.id === item.id && styles.searchResultItemActive]}
+                                                onPress={() => setSelectedProductForSale(item)}
+                                            >
+                                                <View style={styles.thumbWrapper}>
+                                                    {item.image ? (
+                                                        <Image source={{ uri: item.image }} style={styles.thumb} resizeMode="cover" />
+                                                    ) : (
+                                                        <View style={[styles.thumb, { backgroundColor: '#eee', justifyContent: 'center', alignItems: 'center' }]}>
+                                                            <Package size={20} color="#ccc" />
+                                                        </View>
+                                                    )}
+                                                </View>
+                                                <View style={{ flex: 1 }}>
+                                                    <Text style={{ fontWeight: 'bold', fontSize: 16 }}>{item.name}</Text>
+                                                    <Text style={{ color: appTheme.primary, fontWeight: '500' }}>R$ {parseFloat(item.price || '0').toFixed(2).replace('.', ',')}</Text>
+                                                </View>
+                                            </TouchableOpacity>
+                                        )}
+                                        ListEmptyComponent={<View style={{ alignItems: 'center', marginTop: 20 }}><Text style={{ color: '#999' }}>Nenhum produto encontrado.</Text></View>}
+                                    />
+
+                                    <View style={{ flexDirection: 'row', gap: 10, marginTop: 20 }}>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { backgroundColor: '#ccc', flex: 1 }]}
+                                            onPress={() => { setShowProductSearchModal(false); setSelectedProductForSale(null); }}
+                                        >
+                                            <Text style={{ fontWeight: 'bold', color: '#333' }}>CANCELAR</Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                            style={[styles.resBtn, { flex: 1, backgroundColor: appTheme.primary, opacity: selectedProductForSale ? 1 : 0.5 }]}
+                                            onPress={confirmProductSelection}
+                                            disabled={!selectedProductForSale}
+                                        >
+                                            <Text style={{ fontWeight: 'bold', color: '#fff' }}>CONFIRMAR</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            </View>
+                        </Modal>
+                    )}
+
                     {scanning && (
                         <Modal animationType="slide" transparent={false} visible={scanning}>
                             <View style={{ flex: 1, backgroundColor: '#000' }}>
@@ -2939,5 +3184,26 @@ const styles = StyleSheet.create({
         fontSize: 16,
         marginLeft: 15,
         fontWeight: '500',
+    },
+    searchModalCard: {
+        backgroundColor: '#fff',
+        width: '95%',
+        height: '80%',
+        borderRadius: 25,
+        padding: 20,
+    },
+    searchResultItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 12,
+        borderRadius: 15,
+        marginBottom: 10,
+        backgroundColor: '#f9f9f9',
+        borderWidth: 1,
+        borderColor: '#eee',
+    },
+    searchResultItemActive: {
+        borderColor: '#2e7d32',
+        backgroundColor: '#f1f8e9',
     },
 });

@@ -56,7 +56,7 @@ function syncProduct(ss, product) {
     product.id,
     product.name,
     product.size_letter || '',
-    product.size_number || '',
+    product.size_number ? "'" + product.size_number : '',
     product.price,
     product.stock,
     product.category || 'Geral',
