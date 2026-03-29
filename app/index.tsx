@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as DocumentPicker from 'expo-document-picker';
-import { cacheDirectory, copyAsync, documentDirectory, EncodingType, getInfoAsync, makeDirectoryAsync, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
+import { cacheDirectory, copyAsync, documentDirectory, downloadAsync, EncodingType, getInfoAsync, makeDirectoryAsync, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
@@ -53,6 +53,7 @@ import {
     TouchableOpacity,
     View
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
 import { initDatabase } from '../src/database/db';
 import { migrateFromAsyncStorage } from '../src/database/migration';
 import { DatabaseService } from '../src/database/service';
@@ -132,15 +133,47 @@ const ThemeBarWrapper = ({ children, primaryColor }: { children: React.ReactNode
     );
 };
 
+// --- Formatador de URI para Google Drive ---
+const formatImageUri = (uri: string | null) => {
+    if (!uri) return null;
+    if (uri.includes('drive.google.com')) {
+        try {
+            let id = '';
+            if (uri.includes('id=')) {
+                id = uri.split('id=')[1].split('&')[0];
+            } else if (uri.includes('/d/')) {
+                id = uri.split('/d/')[1].split('/')[0];
+            }
+            if (id) {
+                // export=download força o Drive a entregar o arquivo como anexo binário
+                // isso costuma burlar a página de aviso de vírus do Google Drive
+                return `https://drive.google.com/uc?export=download&id=${id}`;
+            }
+        } catch (e) {
+            return uri;
+        }
+    }
+    return uri;
+};
+
 // --- Componentes Memoizados para Performance ---
 
 const InventoryItem = memo(({ item, onPreview, onEdit, onDelete, onAddToQueue, isInQueue, theme }: any) => (
     <View style={styles.itemCard}>
         <View style={styles.row}>
-            <View style={styles.thumbWrapper}>
+            <View style={[styles.thumbWrapper, { backgroundColor: '#eee' }]}>
                 {item.image ? (
                     <TouchableOpacity onPress={() => onPreview(item.image)}>
-                        <Image source={{ uri: item.image }} style={styles.thumb} resizeMode="cover" />
+                        <Image 
+                            key={item.image}
+                            source={{ 
+                                uri: formatImageUri(item.image),
+                                headers: { 'User-Agent': 'Mozilla/5.0' }
+                            }} 
+                            style={styles.thumb} 
+                            resizeMode="cover" 
+                            onError={(e) => console.log("Erro no carregamento da imagem (Lista):", e.nativeEvent.error)}
+                        />
                     </TouchableOpacity>
                 ) : (
                     <View style={[styles.thumb, { backgroundColor: '#eee', justifyContent: 'center', alignItems: 'center' }]}>
@@ -281,6 +314,7 @@ export default function App() {
         setView(targetView);
         toggleDrawer();
     };
+// ... (rest of the code)
 
     const renderDrawer = () => {
         return (
@@ -1610,6 +1644,21 @@ export default function App() {
                                 const productsWithImages: any[] = [];
                                 for (let idx = 0; idx < data.products.length; idx++) {
                                     const p = { ...data.products[idx] };
+
+                                    // --- RESTAURAR HISTÓRICO DO PRODUTO ---
+                                    if (data.product_history) {
+                                        p.history = data.product_history
+                                            .filter((h: any) => h.product_id === p.id)
+                                            .map((h: any) => ({
+                                                date: h.date,
+                                                type: h.type,
+                                                quantity: h.quantity
+                                            }));
+                                    } else {
+                                        p.history = [];
+                                    }
+
+                                    // --- RESTAURAR IMAGEM ---
                                     // Prioridade 1: imagem local já existente com o mesmo ID
                                     if (imageBackupMap[p.id]) {
                                         const localInfo = await getInfoAsync(imageBackupMap[p.id]).catch(() => ({ exists: false }));
@@ -1629,6 +1678,28 @@ export default function App() {
                                         } catch (e) {
                                             console.error("Erro ao restaurar imagem da nuvem:", e);
                                             p.image = null;
+                                        }
+                                    // Prioridade 3: link de imagem externo (ex: Google Drive) vindo da nuvem
+                                    } else if (p.image && p.image.startsWith('http')) {
+                                        try {
+                                            const filename = `prod_${baseTs}_${idx}_dl.jpg`;
+                                            const permanentPath = `${documentDirectory}photos/${filename}`;
+                                            let downloadUrl = p.image;
+                                            
+                                            // Se for do google drive, usar endpoint de download agressivo
+                                            if (downloadUrl.includes('drive.google.com')) {
+                                                let driveId = '';
+                                                if (downloadUrl.includes('id=')) driveId = downloadUrl.split('id=')[1].split('&')[0];
+                                                else if (downloadUrl.includes('/d/')) driveId = downloadUrl.split('/d/')[1].split('/')[0];
+                                                
+                                                if (driveId) downloadUrl = `https://lh3.googleusercontent.com/d/${driveId}`;
+                                            }
+                                            
+                                            const { uri } = await downloadAsync(downloadUrl, permanentPath);
+                                            p.image = uri;
+                                        } catch (e) {
+                                            console.error("Erro ao baixar imagem da nuvem:", e);
+                                            // Mantém a url web caso o download falhe.
                                         }
                                     } else {
                                         // Sem imagem disponível
@@ -2165,7 +2236,15 @@ export default function App() {
                                     <Text style={styles.scanResTitle}>DETALHES DO PRODUTO</Text>
                                     {scannedItem.image && (
                                         <TouchableOpacity onPress={() => setSelectedImage(scannedItem.image)}>
-                                            <Image source={{ uri: scannedItem.image }} style={styles.resImg} />
+                                            <Image 
+                                                key={scannedItem.image}
+                                                source={{ 
+                                                    uri: formatImageUri(scannedItem.image),
+                                                    headers: { 'User-Agent': 'Mozilla/5.0' }
+                                                }} 
+                                                style={[styles.resImg, { backgroundColor: '#eee' }]} 
+                                                resizeMode="cover" 
+                                            />
                                         </TouchableOpacity>
                                     )}
                                     <Text style={styles.resName}>{scannedItem.name}</Text>
@@ -2202,7 +2281,15 @@ export default function App() {
                                 <TouchableOpacity style={styles.previewClose} onPress={() => setSelectedImage(null)}>
                                     <X color="#fff" size={32} />
                                 </TouchableOpacity>
-                                <Image source={{ uri: selectedImage }} style={styles.previewImage} resizeMode="contain" />
+                                <Image 
+                                    key={selectedImage}
+                                    source={{ 
+                                        uri: formatImageUri(selectedImage),
+                                        headers: { 'User-Agent': 'Mozilla/5.0' }
+                                    }} 
+                                    style={[styles.previewImage, { backgroundColor: '#222' }]} 
+                                    resizeMode="contain" 
+                                />
                                 <TouchableOpacity
                                     style={styles.previewShare}
                                     onPress={() => handleShareImage(selectedImage)}
@@ -2324,7 +2411,16 @@ export default function App() {
                                 {prodImage && (
                                     <View style={styles.formImgPrev}>
                                         <Text style={{ color: appTheme.primary, fontWeight: 'bold', fontSize: 10, textAlign: 'center', marginBottom: 5 }}>FOTO CAPTURADA! ✅</Text>
-                                        <Image source={{ uri: prodImage }} style={{ width: '100%', height: 200, borderRadius: 10 }} />
+                                        <Image 
+                                            key={prodImage}
+                                            source={{ 
+                                                uri: formatImageUri(prodImage),
+                                                headers: { 'User-Agent': 'Mozilla/5.0' }
+                                            }} 
+                                            style={{ width: '100%', height: 200, borderRadius: 10, backgroundColor: '#eee' }} 
+                                            resizeMode="cover" 
+                                            onError={(e) => console.log("Erro no carregamento da imagem (Form):", e.nativeEvent.error)}
+                                        />
                                         <TouchableOpacity style={styles.remImg} onPress={() => setProdImage(null)}><X color="#fff" size={16} /></TouchableOpacity>
                                     </View>
                                 )}
@@ -2678,7 +2774,7 @@ export default function App() {
                                             >
                                                 <View style={styles.thumbWrapper}>
                                                     {item.image ? (
-                                                        <Image source={{ uri: item.image }} style={styles.thumb} resizeMode="cover" />
+                                                        <Image source={{ uri: formatImageUri(item.image) }} style={styles.thumb} resizeMode="cover" />
                                                     ) : (
                                                         <View style={[styles.thumb, { backgroundColor: '#eee', justifyContent: 'center', alignItems: 'center' }]}>
                                                             <Package size={20} color="#ccc" />

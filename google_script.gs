@@ -351,6 +351,23 @@ function getAllData(ss) {
       for (var i = 1; i < dataProd.length; i++) {
         var row = dataProd[i];
         if (idxId !== -1 && row[idxId]) {
+          var imgUrl = (idxImage !== -1 && row[idxImage]) ? row[idxImage].toString() : null;
+          var imgBase64 = null;
+          
+          if (imgUrl && imgUrl.indexOf('drive.google.com') > -1) {
+             try {
+                var dId = '';
+                if (imgUrl.indexOf('id=') > -1) dId = imgUrl.split('id=')[1].split('&')[0];
+                else if (imgUrl.indexOf('/d/') > -1) dId = imgUrl.split('/d/')[1].split('/')[0];
+                
+                if (dId) {
+                   var file = DriveApp.getFileById(dId);
+                   var blob = file.getBlob();
+                   imgBase64 = Utilities.base64Encode(blob.getBytes());
+                }
+             } catch(e) {}
+          }
+
           result.products.push({
             id: row[idxId].toString(),
             name: (idxName !== -1 && row[idxName]) ? row[idxName].toString() : '',
@@ -359,7 +376,8 @@ function getAllData(ss) {
             category: (idxCategory !== -1 && row[idxCategory]) ? row[idxCategory].toString() : 'Geral',
             size_number: (idxSizeN !== -1 && row[idxSizeN]) ? parseInt(row[idxSizeN]) : null,
             size_letter: (idxSizeL !== -1 && row[idxSizeL]) ? row[idxSizeL].toString() : null,
-            image: (idxImage !== -1 && row[idxImage]) ? row[idxImage].toString() : null,
+            image: imgUrl,
+            imageBase64: imgBase64,
             history: [] 
           });
         }
