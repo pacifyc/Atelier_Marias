@@ -477,8 +477,26 @@ export default function App() {
 
             const dbCategories = await DatabaseService.getCategories();
             if (dbCategories.length > 0) {
-                setCategories(dbCategories.map(c => c.name));
-                setCategoriesData(dbCategories);
+                // Deduplicar por nome (insensível a case e espaços)
+                const uniqueCats: any[] = [];
+                const seen = new Set<string>();
+                
+                dbCategories.forEach(cat => {
+                    const key = cat.name.toLowerCase().trim();
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        uniqueCats.push(cat);
+                    } else {
+                        // Se encontrar duplicata, priorizar a que tem configuração de tamanho ativada
+                        const existingIdx = uniqueCats.findIndex(c => c.name.toLowerCase().trim() === key);
+                        if (existingIdx > -1 && uniqueCats[existingIdx].size_type === 'none' && cat.size_type !== 'none') {
+                            uniqueCats[existingIdx] = cat;
+                        }
+                    }
+                });
+
+                setCategories(uniqueCats.map(c => c.name));
+                setCategoriesData(uniqueCats);
             } else {
                 setCategories(['Geral']);
                 setCategoriesData([{ name: 'Geral', size_type: 'none' }]);
@@ -582,45 +600,36 @@ export default function App() {
     const handleUpdateInstallment = (idx: number, field: keyof Parcela, value: any) => {
         const newList = [...installmentList];
         if (field === 'value') {
-            // Se o valor for vazio (usuário apagando), mantemos como string vazia temporariamente no input,
-            // mas no estado numérico tratamos de forma que permita a redistribuição.
             const rawValue = value.replace(',', '.');
             const numValue = parseFloat(rawValue) || 0;
 
             newList[idx].value = numValue;
             newList[idx].isLocked = true; // Marca como editada manualmente
 
-            // Redistribuição automática
+            // Redistribuição automática nas parcelas seguintes
             const total = products.reduce((acc, curr) => {
                 const p = parseFloat(curr.price || '0');
                 const q = parseInt(curr.quantity || '1') || 1;
                 return acc + (p * q);
             }, 0);
 
-            // Calculamos quanto já foi travado (incluindo a que acabamos de editar)
-            const lockedValue = newList.reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
+            const sumBeforeAndCurrent = newList.slice(0, idx + 1).reduce((acc, inst) => acc + inst.value, 0);
+            const remainingToDistribute = Math.max(0, total - sumBeforeAndCurrent);
+            const remainingInstallmentsCount = newList.length - (idx + 1);
 
-            // Identificamos as parcelas seguintes (após a atual) que NÃO estão travadas
-            const targets = newList.slice(idx + 1).filter(inst => !inst.isLocked);
+            if (remainingInstallmentsCount > 0) {
+                const distributedValue = Number((remainingToDistribute / remainingInstallmentsCount).toFixed(2));
+                const totalDistributed = distributedValue * remainingInstallmentsCount;
+                const diff = Number((remainingToDistribute - totalDistributed).toFixed(2));
 
-            if (targets.length > 0) {
-                // Se houver parcelas destravadas após a atual, divide o saldo entre elas
-                const alreadyLockedValueBeforeIdx = newList.slice(0, idx + 1).reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
-                const lockedValueAfterIdx = newList.slice(idx + 1).reduce((acc, inst) => inst.isLocked ? acc + inst.value : acc, 0);
-
-                const remainingToDistribute = Math.max(0, total - alreadyLockedValueBeforeIdx - lockedValueAfterIdx);
-                const distributedValue = Number((remainingToDistribute / targets.length).toFixed(2));
-
-                // Aplica o valor distribuído apenas nas destravadas após a editada
                 for (let i = idx + 1; i < newList.length; i++) {
-                    if (!newList[i].isLocked) {
-                        newList[i].value = distributedValue;
+                    newList[i].value = distributedValue;
+                    newList[i].isLocked = false; // Destrava as seguintes
+                    
+                    if (i === newList.length - 1 && diff !== 0) {
+                        newList[i].value = Number((distributedValue + diff).toFixed(2));
                     }
                 }
-            } else {
-                // Se não houver destravadas APÓS, mas houver destravadas ANTES, distribui nelas?
-                // Melhor manter o solicitado: redistribuir o valor restante nas parcelas seguintes.
-                // Se não houver seguintes, a soma pode não bater até que o usuário ajuste.
             }
         } else {
             newList[idx][field] = value;
@@ -1300,19 +1309,40 @@ export default function App() {
 
     const handleAddCategory = () => {
         if (!newCategoryName.trim()) return;
-        if (categories.includes(newCategoryName.trim())) {
-            Alert.alert('Erro', 'Categoria já existe.');
+        const newCat = newCategoryName.trim();
+        const normalizedNewCat = newCat.toLowerCase();
+
+        const existingIdx = categoriesData.findIndex(c => c.name.toLowerCase().trim() === normalizedNewCat);
+
+        if (existingIdx > -1) {
+            // Atualiza categoria existente em vez de dar erro
+            const targetName = categoriesData[existingIdx].name;
+            const updatedData = categoriesData.map((c, idx) => 
+                idx === existingIdx ? { ...c, size_type: newCategorySizeType } : c
+            );
+            setCategoriesData(updatedData);
+            DatabaseService.addCategory(targetName, newCategorySizeType);
+            
+            setNewCategoryName('');
+            setNewCategorySizeType('none');
+            setShowCategoryModal(false);
+            setSelectedCategory(targetName);
+            setProdCategory(targetName); 
+            
+            Alert.alert('Sucesso', 'Configuração da categoria atualizada!');
             return;
         }
-        const newCat = newCategoryName.trim();
+
         const updated = [...categories, newCat];
         setCategories(updated);
         setCategoriesData([...categoriesData, { name: newCat, size_type: newCategorySizeType }]);
         DatabaseService.addCategory(newCat, newCategorySizeType);
+        
         setNewCategoryName('');
         setNewCategorySizeType('none');
         setShowCategoryModal(false);
-        setSelectedCategory(newCategoryName.trim());
+        setSelectedCategory(newCat);
+        setProdCategory(newCat);
     };
 
     const handleDeleteCategory = () => {
@@ -2336,7 +2366,7 @@ export default function App() {
                                 </ScrollView>
 
                                 {(() => {
-                                    const catData = categoriesData.find(c => c.name === prodCategory);
+                                    const catData = categoriesData.find(c => c.name.toLowerCase().trim() === prodCategory.toLowerCase().trim());
                                     const type = catData ? catData.size_type : 'none';
                                     
                                     if (type === 'letter') {

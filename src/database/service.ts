@@ -62,15 +62,16 @@ export const DatabaseService = {
 
     addCategory: async (name: string, size_type: 'none' | 'letter' | 'number' = 'none', skipSync: boolean = false): Promise<boolean> => {
         const database = await initDatabase();
+        const trimmedName = name.trim();
         try {
-            await database.runAsync('INSERT OR IGNORE INTO categories (name, size_type) VALUES (?, ?)', name, size_type);
+            await database.runAsync('INSERT INTO categories (name, size_type) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET size_type = excluded.size_type', trimmedName, size_type);
 
             if (!skipSync) {
                 // Sync to Cloud
                 SyncService.addToQueue({
-                    id: name,
+                    id: trimmedName,
                     action: 'sync_category',
-                    payload: { name, size_type },
+                    payload: { name: trimmedName, size_type },
                     timestamp: Date.now()
                 });
             }
@@ -84,14 +85,15 @@ export const DatabaseService = {
 
     deleteCategory: async (name: string): Promise<boolean> => {
         const database = await initDatabase();
+        const trimmedName = name.trim();
         try {
-            await database.runAsync('DELETE FROM categories WHERE name = ?', name);
+            await database.runAsync('DELETE FROM categories WHERE name = ?', trimmedName);
 
             // Sync deletion to Cloud
             SyncService.addToQueue({
-                id: name,
+                id: trimmedName,
                 action: 'delete_category',
-                payload: name,
+                payload: trimmedName,
                 timestamp: Date.now()
             });
 

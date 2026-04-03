@@ -213,6 +213,13 @@ function ensureHeaders(sheet, headers) {
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(headers);
     sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#d9ead3");
+  } else {
+    var numCols = sheet.getLastColumn();
+    // Se a planilha já tem dados mas tem menos colunas que o esperado no cabeçalho
+    if (numCols < headers.length) {
+      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#d9ead3");
+    }
   }
 }
 
@@ -220,11 +227,13 @@ function upsertRow(sheet, keyHeader, keyValue, rowData) {
   var data = sheet.getDataRange().getValues();
   var headerRow = data[0];
   var keyColIndex = headerRow.indexOf(keyHeader);
-  
   if (keyColIndex === -1) return sheet.appendRow(rowData);
   
+  var normalizedKey = keyValue.toString().toLowerCase().trim();
+  
   for (var i = 1; i < data.length; i++) {
-    if (data[i][keyColIndex].toString() === keyValue.toString()) {
+    var cellValue = data[i][keyColIndex] ? data[i][keyColIndex].toString().toLowerCase().trim() : "";
+    if (cellValue === normalizedKey) {
       sheet.getRange(i + 1, 1, 1, rowData.length).setValues([rowData]);
       return;
     }
@@ -239,11 +248,13 @@ function deleteRow(ss, sheetName, keyHeader, keyValue) {
   var data = sheet.getDataRange().getValues();
   var headerRow = data[0];
   var keyColIndex = headerRow.indexOf(keyHeader);
-  
   if (keyColIndex === -1) return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
   
+  var normalizedKey = keyValue.toString().toLowerCase().trim();
+  
   for (var i = data.length - 1; i >= 1; i--) {
-    if (data[i][keyColIndex].toString() === keyValue.toString()) {
+    var cellValue = data[i][keyColIndex] ? data[i][keyColIndex].toString().toLowerCase().trim() : "";
+    if (cellValue === normalizedKey) {
       sheet.deleteRow(i + 1);
     }
   }
@@ -257,9 +268,12 @@ function deleteRowsByValue(sheet, keyHeader, keyValue) {
   var headerRow = data[0];
   var keyColIndex = headerRow.indexOf(keyHeader);
   if (keyColIndex === -1) return;
+
+  var normalizedKey = keyValue.toString().toLowerCase().trim();
   
   for (var i = data.length - 1; i >= 1; i--) {
-    if (data[i][keyColIndex].toString() === keyValue.toString()) {
+    var cellValue = data[i][keyColIndex] ? data[i][keyColIndex].toString().toLowerCase().trim() : "";
+    if (cellValue === normalizedKey) {
       sheet.deleteRow(i + 1);
     }
   }
@@ -319,9 +333,9 @@ function getAllData(ss) {
         if (idxName !== -1 && row[idxName]) {
           var sType = 'none';
           if (idxType !== -1 && row[idxType]) {
-            var val = row[idxType].toString();
-            if (val === 'Literal') sType = 'letter';
-            else if (val === 'Numeral') sType = 'number';
+            var val = row[idxType].toString().trim().toLowerCase();
+            if (val === 'literal' || val === 'letter') sType = 'letter';
+            else if (val === 'numeral' || val === 'number') sType = 'number';
           }
           result.categories.push({
             id: i, // Use row index as ID if not present
